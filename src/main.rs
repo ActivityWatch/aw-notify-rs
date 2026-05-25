@@ -132,6 +132,9 @@ struct Cli {
     #[clap(short, long, help = "Verbose logging")]
     verbose: bool,
 
+    #[clap(short, long, help = "Path to custom configuration file")]
+    config: Option<std::path::PathBuf>,
+
     #[clap(long, help = "Testing mode (port 5666)")]
     testing: bool,
 
@@ -172,8 +175,8 @@ enum Commands {
 }
 
 // Configuration loading functions
-fn load_config() -> Result<NotificationConfig> {
-    let config_path = dirs::get_default_config_path();
+fn load_config(custom_path: Option<std::path::PathBuf>) -> Result<NotificationConfig> {
+    let config_path = custom_path.unwrap_or_else(dirs::get_default_config_path);
 
     if !config_path.exists() {
         log::info!(
@@ -223,7 +226,7 @@ fn main() -> Result<()> {
     match cli.command.unwrap_or(Commands::Start) {
         Commands::Start => {
             // Load configuration
-            let config = load_config()?;
+            let config = load_config(cli.config.clone())?;
 
             // Initialize client (matching Python's start function)
             let port = cli.port.unwrap_or(if cli.testing { 5666 } else { 5600 });
