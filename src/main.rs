@@ -77,6 +77,7 @@ pub struct NotificationConfig {
     pub hourly_checkins: bool,
     pub new_day_greetings: bool,
     pub server_monitoring: bool,
+    pub productivity_score: bool,
 }
 
 impl Default for NotificationConfig {
@@ -111,6 +112,7 @@ impl Default for NotificationConfig {
             hourly_checkins: true,
             new_day_greetings: true,
             server_monitoring: true,
+            productivity_score: true,
         }
     }
 }
@@ -133,8 +135,9 @@ struct Cli {
     port: Option<u16>,
 
     #[clap(
-        long,
-        help = "Output only mode - print notification content to stdout instead of showing desktop notifications"
+        short,
+        long = "output-only",
+        help = "Only print JSON to stdout, no desktop notifications"
     )]
     output_only: bool,
 
@@ -320,7 +323,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     log::debug!("Signal handler installed successfully");
 
     // Send initial notifications (batched for output-only mode)
-    if let Err(e) = send_initial_checkins() {
+    if let Err(e) = send_initial_checkins(config.productivity_score) {
         log::warn!("Failed to send initial checkins: {} (continuing anyway)", e);
     }
 
@@ -332,7 +335,11 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     }
 
     if config.new_day_greetings {
-        start_new_day(hostname.clone(), shutdown_rx_newday);
+        start_new_day(
+            hostname.clone(),
+            shutdown_rx_newday,
+            config.productivity_score,
+        );
     } else {
         log::info!("New day greetings disabled in configuration");
     }
@@ -713,6 +720,70 @@ RETURN = {{"events": events, "duration": duration, "cat_events": cat_events}};"#
     }
 }
 
+fn get_category_score(name: &[String], classes: &[ClassSetting]) -> f64 {
+    if let Some(class) = classes.iter().find(|c| c.name == name) {
+        if let Some(data) = &class.data {
+            if let Some(score_val) = data.get("score") {
+                if let Some(score_f64) = score_val.as_f64() {
+                    return score_f64;
+                }
+                if let Some(score_str) = score_val.as_str() {
+                    if let Ok(score_f64) = score_str.parse::<f64>() {
+                        return score_f64;
+                    }
+                }
+            }
+        }
+    }
+    if name.len() > 1 {
+        let parent_name = &name[0..name.len() - 1];
+        return get_category_score(parent_name, classes);
+    }
+    0.0
+}
+
+fn calculate_productivity_score(date: Option<DateTime<Utc>>) -> Result<Option<(f64, f64)>> {
+    let raw_cat_time = get_time(date, CategoryAggregation::None)?;
+    let client = AW_CLIENT
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Client not initialized"))?;
+
+    let classes: Vec<ClassSetting> = client
+        .get_setting("classes")
+        .ok()
+        .and_then(|val| serde_json::from_value(val).ok())
+        .unwrap_or_default();
+
+    if classes.is_empty() {
+        return Ok(None);
+    }
+
+    let mut total_score = 0.0;
+    let mut productive_time = 0.0;
+    let mut total_time = 0.0;
+
+    for (cat_name, duration_sec) in &raw_cat_time {
+        if cat_name == "All" {
+            continue;
+        }
+        total_time += duration_sec;
+        let parts: Vec<String> = cat_name.split(" > ").map(|s| s.to_string()).collect();
+        let score = get_category_score(&parts, &classes);
+        let cat_score = (duration_sec / 3600.0) * score;
+        total_score += cat_score;
+        if cat_score > 0.0 {
+            productive_time += duration_sec;
+        }
+    }
+
+    if total_time == 0.0 {
+        return Ok(None);
+    }
+
+    let productive_percent = (productive_time / total_time) * 100.0;
+    Ok(Some((total_score, productive_percent)))
+}
+
 fn send_checkin(title: &str, date: Option<DateTime<Utc>>) -> Result<()> {
     log::info!("Sending checkin: {}", title);
 
@@ -764,7 +835,16 @@ fn send_checkin_yesterday() -> Result<()> {
     send_checkin("Time yesterday", Some(yesterday))
 }
 
-fn send_initial_checkins() -> Result<()> {
+fn send_productivity_score_yesterday() -> Result<()> {
+    let yesterday = Local::now().with_timezone(&Utc) - Duration::days(1);
+    if let Ok(Some((score, percent))) = calculate_productivity_score(Some(yesterday)) {
+        let message = format!("{:+.1} ({:.1}% productive)", score, percent);
+        notify("Productivity Score", &message)?;
+    }
+    Ok(())
+}
+
+fn send_initial_checkins(productivity_score: bool) -> Result<()> {
     log::info!("Sending initial checkins (batched)");
 
     let output_only = OUTPUT_ONLY.load(Ordering::Relaxed);
@@ -794,6 +874,21 @@ fn send_initial_checkins() -> Result<()> {
             });
             output.push_str(&serde_json::to_string(&notification_yesterday)?);
             output.push('\n');
+
+            if productivity_score {
+                if let Ok(Some((score, percent))) = calculate_productivity_score(Some(yesterday)) {
+                    let notification_score = serde_json::json!({
+                        "timestamp": Utc::now().to_rfc3339(),
+                        "title": "Productivity Score",
+                        "message": format!("{:+.1} ({:.1}% productive)", score, percent),
+                        "app": "ActivityWatch",
+                        "score": score,
+                        "productive_percent": percent,
+                    });
+                    output.push_str(&serde_json::to_string(&notification_score)?);
+                    output.push('\n');
+                }
+            }
         }
 
         // Get today's data
@@ -830,6 +925,16 @@ fn send_initial_checkins() -> Result<()> {
                 e
             );
         }
+
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if productivity_score {
+                if let Err(e) = send_productivity_score_yesterday() {
+                    log::warn!("Failed to send yesterday's productivity score: {}", e);
+                }
+            }
+        });
+
         if let Err(e) = send_checkin("Time today", None) {
             log::warn!("Failed to send initial checkin: {} (continuing anyway)", e);
         }
@@ -894,7 +999,7 @@ fn start_hourly(hostname: String, shutdown_rx: Receiver<()>) {
     });
 }
 
-fn start_new_day(hostname: String, shutdown_rx: Receiver<()>) {
+fn start_new_day(hostname: String, shutdown_rx: Receiver<()>, productivity_score: bool) {
     thread::spawn(move || {
         log::info!("Starting new day notification thread");
 
@@ -924,6 +1029,14 @@ fn start_new_day(hostname: String, shutdown_rx: Receiver<()>) {
                         if let Err(e) = notify("New day", &message) {
                             log::error!("Failed to send new day notification: {}", e);
                         }
+
+                        if productivity_score {
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            if let Err(e) = send_productivity_score_yesterday() {
+                                log::warn!("Failed to send yesterday's productivity score: {}", e);
+                            }
+                        }
+
                         last_day = day;
                     }
                     Ok(Some(false)) => {
