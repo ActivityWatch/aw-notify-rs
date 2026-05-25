@@ -17,6 +17,9 @@ new_day_greetings = true
 # Enable or disable ActivityWatch server monitoring alerts
 server_monitoring = true
 
+# Enable or disable productivity score notification on new day
+productivity_score = true
+
 # Category alerts configuration
 # Each alert monitors a specific category and sends notifications when thresholds are reached
 [[alerts]]
