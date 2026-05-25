@@ -35,6 +35,9 @@ static OUTPUT_ONLY: AtomicBool = AtomicBool::new(false);
 type CacheValue = (DateTime<Utc>, HashMap<String, f64>);
 static TIME_CACHE: Lazy<DashMap<String, CacheValue>> = Lazy::new(DashMap::new);
 
+type ClassesCacheValue = (DateTime<Utc>, Vec<ClassSetting>);
+static CLASSES_CACHE: Lazy<DashMap<String, ClassesCacheValue>> = Lazy::new(DashMap::new);
+
 // Constants (matching Python exactly)
 const TIME_OFFSET: Duration = Duration::hours(4);
 const CACHE_TTL_SECONDS: i64 = 60;
@@ -72,6 +75,7 @@ impl Default for AlertConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NotificationConfig {
     pub alerts: Vec<AlertConfig>,
     pub hourly_checkins: bool,
@@ -553,32 +557,37 @@ fn get_time(
     date: Option<DateTime<Utc>>,
     aggregation_mode: CategoryAggregation,
 ) -> Result<HashMap<String, f64>> {
-    let cache_key = format!("{:?}_{:?}", date, aggregation_mode);
+    let cache_key = format!("{:?}", date);
 
-    // Check cache first (matching Python's @cache_ttl decorator)
-    if let Some(entry) = TIME_CACHE.get(&cache_key) {
-        let (cached_time, cached_data) = entry.value();
-        if (Local::now().with_timezone(&Utc) - *cached_time).num_seconds() < CACHE_TTL_SECONDS {
-            return Ok(cached_data.clone());
+    let raw_data = {
+        let mut hit = None;
+        if let Some(entry) = TIME_CACHE.get(&cache_key) {
+            let (cached_time, cached_data) = entry.value();
+            if (Local::now().with_timezone(&Utc) - *cached_time).num_seconds() < CACHE_TTL_SECONDS {
+                hit = Some(cached_data.clone());
+            }
         }
+        hit
+    };
+
+    let result = match raw_data {
+        Some(data) => data,
+        None => {
+            let res = query_activitywatch(date)?;
+            TIME_CACHE.insert(cache_key, (Local::now().with_timezone(&Utc), res.clone()));
+            res
+        }
+    };
+
+    // Apply aggregation based on the mode
+    match aggregation_mode {
+        CategoryAggregation::None => Ok(result),
+        CategoryAggregation::TopLevelOnly => Ok(aggregate_categories_by_top_level(&result)),
+        CategoryAggregation::AllLevels => Ok(aggregate_categories_by_all_levels(&result)),
     }
-
-    // Query ActivityWatch (matching Python logic exactly)
-    let result = query_activitywatch(date, aggregation_mode)?;
-
-    // Cache the result
-    TIME_CACHE.insert(
-        cache_key,
-        (Local::now().with_timezone(&Utc), result.clone()),
-    );
-
-    Ok(result)
 }
 
-fn query_activitywatch(
-    date: Option<DateTime<Utc>>,
-    aggregation_mode: CategoryAggregation,
-) -> Result<HashMap<String, f64>> {
+fn query_activitywatch(date: Option<DateTime<Utc>>) -> Result<HashMap<String, f64>> {
     let client = AW_CLIENT
         .get()
         .ok_or_else(|| anyhow!("Client not initialized"))?;
@@ -649,7 +658,7 @@ fn query_activitywatch(
         r#"{}
 duration = sum_durations(events);
 cat_events = sort_by_duration(merge_events_by_keys(events, ["$category"]));
-RETURN = {{"events": events, "duration": duration, "cat_events": cat_events}};"#,
+RETURN = {{"duration": duration, "cat_events": cat_events}};"#,
         canonical_events
     );
 
@@ -712,12 +721,7 @@ RETURN = {{"events": events, "duration": duration, "cat_events": cat_events}};"#
         cat_time.insert("All".to_string(), 0.0);
     }
 
-    // Apply aggregation based on the mode
-    match aggregation_mode {
-        CategoryAggregation::None => Ok(cat_time),
-        CategoryAggregation::TopLevelOnly => Ok(aggregate_categories_by_top_level(&cat_time)),
-        CategoryAggregation::AllLevels => Ok(aggregate_categories_by_all_levels(&cat_time)),
-    }
+    Ok(cat_time)
 }
 
 fn get_category_score(name: &[String], classes: &[ClassSetting]) -> f64 {
@@ -744,15 +748,7 @@ fn get_category_score(name: &[String], classes: &[ClassSetting]) -> f64 {
 
 fn calculate_productivity_score(date: Option<DateTime<Utc>>) -> Result<Option<(f64, f64)>> {
     let raw_cat_time = get_time(date, CategoryAggregation::None)?;
-    let client = AW_CLIENT
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("Client not initialized"))?;
-
-    let classes: Vec<ClassSetting> = client
-        .get_setting("classes")
-        .ok()
-        .and_then(|val| serde_json::from_value(val).ok())
-        .unwrap_or_default();
+    let classes = get_server_classes_settings();
 
     if classes.is_empty() {
         return Ok(None);
@@ -874,21 +870,6 @@ fn send_initial_checkins(productivity_score: bool) -> Result<()> {
             });
             output.push_str(&serde_json::to_string(&notification_yesterday)?);
             output.push('\n');
-
-            if productivity_score {
-                if let Ok(Some((score, percent))) = calculate_productivity_score(Some(yesterday)) {
-                    let notification_score = serde_json::json!({
-                        "timestamp": Utc::now().to_rfc3339(),
-                        "title": "Productivity Score",
-                        "message": format!("{:+.1} ({:.1}% productive)", score, percent),
-                        "app": "ActivityWatch",
-                        "score": score,
-                        "productive_percent": percent,
-                    });
-                    output.push_str(&serde_json::to_string(&notification_score)?);
-                    output.push('\n');
-                }
-            }
         }
 
         // Get today's data
@@ -926,19 +907,20 @@ fn send_initial_checkins(productivity_score: bool) -> Result<()> {
             );
         }
 
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            if productivity_score {
-                if let Err(e) = send_productivity_score_yesterday() {
-                    log::warn!("Failed to send yesterday's productivity score: {}", e);
-                }
-            }
-        });
-
         if let Err(e) = send_checkin("Time today", None) {
             log::warn!("Failed to send initial checkin: {} (continuing anyway)", e);
         }
     }
+
+    // Always send the productivity score 5 seconds later
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        if productivity_score {
+            if let Err(e) = send_productivity_score_yesterday() {
+                log::warn!("Failed to send yesterday's productivity score: {}", e);
+            }
+        }
+    });
 
     Ok(())
 }
@@ -1325,40 +1307,53 @@ fn decode_unicode_escapes(s: &str) -> String {
 }
 
 // === CATEGORY MATCHING AND PROCESSING FUNCTIONS ===
-//Get categorization classes from server with fallback to defaults
-fn get_server_classes() -> Vec<(CategoryId, CategorySpec)> {
-    // Try to get classes from server (like old version)
-    let client = AW_CLIENT.get().unwrap();
+fn get_server_classes_settings() -> Vec<ClassSetting> {
+    if let Some(entry) = CLASSES_CACHE.get("classes") {
+        let (cached_time, cached_data) = entry.value();
+        if (Local::now().with_timezone(&Utc) - *cached_time).num_seconds() < CACHE_TTL_SECONDS * 5 {
+            return cached_data.clone();
+        }
+    }
 
-    client
+    let client = AW_CLIENT.get().expect("AW_CLIENT not initialized");
+    let classes = client
         .get_setting("classes")
         .map(|setting_value| {
-            // Try to deserialize the setting into Vec<ClassSetting>
             if setting_value.is_null() {
-                return default_classes();
+                return Vec::new();
             }
 
-            let class_settings: Vec<ClassSetting> = match serde_json::from_value(setting_value) {
+            match serde_json::from_value::<Vec<ClassSetting>>(setting_value) {
                 Ok(classes) => classes,
                 Err(e) => {
-                    log::warn!(
-                        "Failed to deserialize classes setting: {}, using default classes",
-                        e
-                    );
-                    return default_classes();
+                    log::warn!("Failed to deserialize classes setting: {}", e);
+                    Vec::new()
                 }
-            };
-
-            // Convert ClassSetting to (CategoryId, CategorySpec) format
-            class_settings
-                .into_iter()
-                .map(|class| (class.name, class.rule))
-                .collect()
+            }
         })
         .unwrap_or_else(|_| {
-            log::warn!("Failed to get classes from server, using default classes as fallback",);
-            default_classes()
-        })
+            log::warn!("Failed to get classes from server");
+            Vec::new()
+        });
+
+    CLASSES_CACHE.insert(
+        "classes".to_string(),
+        (Local::now().with_timezone(&Utc), classes.clone()),
+    );
+    classes
+}
+
+// Get categorization classes from server with fallback to defaults
+fn get_server_classes() -> Vec<(CategoryId, CategorySpec)> {
+    let class_settings = get_server_classes_settings();
+    if class_settings.is_empty() {
+        return default_classes();
+    }
+
+    class_settings
+        .into_iter()
+        .map(|class| (class.name, class.rule))
+        .collect()
 }
 
 /// Aggregate hierarchical categories by their top-level category
