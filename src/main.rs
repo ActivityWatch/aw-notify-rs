@@ -9,7 +9,7 @@ use aw_client_rust::queries::{DesktopQueryParams, QueryParams, QueryParamsBase};
 use aw_models::TimeInterval;
 use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
 use clap::Parser;
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, unbounded, Receiver};
 use dashmap::DashMap;
 use hostname::get as get_hostname;
 use notify_rust::Notification;
@@ -31,6 +31,14 @@ static AW_CLIENT: OnceLock<aw_client_rust::blocking::AwClient> = OnceLock::new()
 static HOSTNAME: OnceLock<String> = OnceLock::new();
 static SERVER_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static OUTPUT_ONLY: AtomicBool = AtomicBool::new(false);
+static NOTIFICATION_TX: OnceLock<crossbeam_channel::Sender<QueuedNotification>> = OnceLock::new();
+
+#[derive(Debug)]
+pub struct QueuedNotification {
+    pub title: String,
+    pub message: String,
+    pub sender: Option<String>,
+}
 
 type CacheValue = (DateTime<Utc>, HashMap<String, f64>);
 static TIME_CACHE: Lazy<DashMap<String, CacheValue>> = Lazy::new(DashMap::new);
@@ -125,6 +133,8 @@ impl Default for NotificationConfig {
 pub struct NotificationRequest {
     pub title: String,
     pub message: String,
+    #[serde(alias = "watcher")]
+    pub sender: Option<String>,
 }
 
 #[derive(Parser)]
@@ -312,6 +322,13 @@ fn run_app(cli: Cli) -> Result<()> {
 fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     log::info!("Starting notification service...");
 
+    // Initialize notification queue and worker thread (unbounded queue)
+    let (notification_tx, notification_rx) = unbounded::<QueuedNotification>();
+    NOTIFICATION_TX.set(notification_tx).unwrap();
+
+    let (shutdown_tx_worker, shutdown_rx_worker) = bounded::<()>(1);
+    start_notification_worker(notification_rx, shutdown_rx_worker);
+
     // Create shutdown channels for each thread
     let (shutdown_tx_main, shutdown_rx_main) = bounded::<()>(1);
     let (shutdown_tx_hourly, shutdown_rx_hourly) = bounded::<()>(1);
@@ -327,6 +344,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
         shutdown_tx_newday.clone(),
         shutdown_tx_monitor.clone(),
         shutdown_tx_http.clone(),
+        shutdown_tx_worker.clone(),
     ];
 
     if let Err(e) = ctrlc::set_handler(move || {
@@ -1175,20 +1193,60 @@ fn start_http_server(shutdown_rx: Receiver<()>) {
 
                         match serde_json::from_str::<NotificationRequest>(&content) {
                             Ok(req) => {
-                                if let Err(e) = notify(&req.title, &req.message) {
-                                    log::error!("Failed to show notification from HTTP API: {}", e);
-                                    let response = tiny_http::Response::from_string(
-                                        "Failed to show notification",
-                                    )
-                                    .with_status_code(500);
-                                    let _ = request.respond(response);
+                                let title = req.title;
+                                let message = req.message;
+                                let sender = req.sender;
+                                let sender_name =
+                                    sender.as_deref().unwrap_or("unknown").to_string();
+
+                                if let Some(tx) = NOTIFICATION_TX.get() {
+                                    if tx.len() < 10 {
+                                        let msg = QueuedNotification {
+                                            title: title.clone(),
+                                            message,
+                                            sender,
+                                        };
+                                        match tx.send(msg) {
+                                            Ok(()) => {
+                                                log::info!(
+                                                    "Successfully queued HTTP notification request from \"{}\": {}",
+                                                    sender_name,
+                                                    title
+                                                );
+                                                let response =
+                                                    tiny_http::Response::from_string("OK")
+                                                        .with_status_code(200);
+                                                let _ = request.respond(response);
+                                            }
+                                            Err(_) => {
+                                                log::error!(
+                                                    "Failed to queue HTTP notification: channel disconnected (sender: {})",
+                                                    sender_name
+                                                );
+                                                let response = tiny_http::Response::from_string(
+                                                    "Service Unavailable",
+                                                )
+                                                .with_status_code(503);
+                                                let _ = request.respond(response);
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "Failed to queue HTTP notification: queue full (len: {}, sender: {})",
+                                            tx.len(),
+                                            sender_name
+                                        );
+                                        let response = tiny_http::Response::from_string(
+                                            "Too Many Requests (Buffer Full)",
+                                        )
+                                        .with_status_code(429);
+                                        let _ = request.respond(response);
+                                    }
                                 } else {
-                                    log::info!(
-                                        "Successfully handled HTTP notification request: {}",
-                                        req.title
-                                    );
-                                    let response = tiny_http::Response::from_string("OK")
-                                        .with_status_code(200);
+                                    log::error!("Notification queue not initialized");
+                                    let response =
+                                        tiny_http::Response::from_string("Service Unavailable")
+                                            .with_status_code(503);
                                     let _ = request.respond(response);
                                 }
                             }
@@ -1304,16 +1362,90 @@ fn check_server_availability() -> bool {
 }
 
 fn notify(title: &str, message: &str) -> Result<()> {
+    enqueue_notification(title, message, None)
+}
+
+fn enqueue_notification(title: &str, message: &str, sender: Option<&str>) -> Result<()> {
+    if let Some(tx) = NOTIFICATION_TX.get() {
+        let msg = QueuedNotification {
+            title: title.to_string(),
+            message: message.to_string(),
+            sender: sender.map(|s| s.to_string()),
+        };
+        // Blocks if queue is full (ensures backpressure for internal alerts)
+        if let Err(e) = tx.send(msg) {
+            log::error!("Failed to send notification to queue: {}", e);
+            // Fallback to synchronous display if sending fails
+            return display_notification(title, message, sender);
+        }
+        Ok(())
+    } else {
+        display_notification(title, message, sender)
+    }
+}
+
+fn start_notification_worker(rx: Receiver<QueuedNotification>, shutdown_rx: Receiver<()>) {
+    thread::spawn(move || {
+        log::info!("Starting notification worker thread");
+        let mut last_display = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        loop {
+            crossbeam_channel::select! {
+                recv(rx) -> msg_res => {
+                    match msg_res {
+                        // microsecond precision coz YOLO
+                        Ok(msg) => {
+                            let now = std::time::Instant::now();
+                            let min_delay = std::time::Duration::from_secs(1);
+                            let scheduled = last_display + min_delay;
+
+                            if scheduled > now {
+                                thread::sleep(scheduled - now);
+                                last_display = scheduled;
+                            } else {
+                                last_display = now;
+                            }
+
+                            if let Err(e) = display_notification(&msg.title, &msg.message, msg.sender.as_deref()) {
+                                log::error!("Error displaying notification: {}", e);
+                            }
+                        }
+                        Err(_) => {
+                            log::warn!("Notification worker channel disconnected");
+                            break;
+                        }
+                    }
+                }
+                recv(shutdown_rx) -> _ => {
+                    log::info!("Shutdown signal received, stopping notification worker thread");
+                    break;
+                }
+            }
+        }
+        log::info!("Notification worker thread stopped");
+    });
+}
+
+fn display_notification(title: &str, message: &str, sender: Option<&str>) -> Result<()> {
     let output_only = OUTPUT_ONLY.load(Ordering::Relaxed);
 
     if output_only {
         // Output only mode - print as JSON Lines format
-        let notification = serde_json::json!({
+        let mut notification = serde_json::json!({
             "timestamp": Utc::now().to_rfc3339(),
             "title": title,
             "message": message,
             "app": "ActivityWatch",
         });
+
+        if let Some(s) = sender {
+            if let Some(obj) = notification.as_object_mut() {
+                obj.insert(
+                    "sender".to_string(),
+                    serde_json::Value::String(s.to_string()),
+                );
+            }
+        }
 
         // Combine into one buffer and write once
         let mut output = serde_json::to_string(&notification)?;
@@ -1325,7 +1457,11 @@ fn notify(title: &str, message: &str) -> Result<()> {
         return Ok(());
     }
 
-    log::info!(r#"Showing: "{}\n{}""#, title, message);
+    if let Some(s) = sender {
+        log::info!(r#"Showing (sender: {}): "{}\n{}""#, s, title, message);
+    } else {
+        log::info!(r#"Showing: "{}\n{}""#, title, message);
+    }
 
     // Try terminal-notifier first on macOS (like Python)
     #[cfg(target_os = "macos")]
@@ -1353,7 +1489,6 @@ fn try_terminal_notifier(title: &str, message: &str) -> Result<bool> {
     // Check if terminal-notifier is available (like Python's shutil.which)
     match Command::new("which").arg("terminal-notifier").output() {
         Ok(output) if output.status.success() => {
-            // terminal-notifier is available, use it
             let result = Command::new("terminal-notifier")
                 .arg("-title")
                 .arg("ActivityWatch")
