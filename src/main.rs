@@ -219,6 +219,15 @@ fn main() -> Result<()> {
 
     log::info!("Starting...");
 
+    if let Err(e) = run_app(cli) {
+        log::error!("Fatal error: {}", e);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn run_app(cli: Cli) -> Result<()> {
     // Set global output-only flag
     OUTPUT_ONLY.store(cli.output_only, Ordering::Relaxed);
 
