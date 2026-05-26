@@ -121,6 +121,12 @@ impl Default for NotificationConfig {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct NotificationRequest {
+    pub title: String,
+    pub message: String,
+}
+
 #[derive(Parser)]
 #[clap(
     name = "aw-notify",
@@ -311,6 +317,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     let (shutdown_tx_hourly, shutdown_rx_hourly) = bounded::<()>(1);
     let (shutdown_tx_newday, shutdown_rx_newday) = bounded::<()>(1);
     let (shutdown_tx_monitor, shutdown_rx_monitor) = bounded::<()>(1);
+    let (shutdown_tx_http, shutdown_rx_http) = bounded::<()>(1);
 
     // Setup signal handler for graceful shutdown (handles Ctrl+C, SIGTERM, etc.)
     // This uses the ctrlc crate which provides cross-platform signal handling
@@ -319,6 +326,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
         shutdown_tx_hourly.clone(),
         shutdown_tx_newday.clone(),
         shutdown_tx_monitor.clone(),
+        shutdown_tx_http.clone(),
     ];
 
     if let Err(e) = ctrlc::set_handler(move || {
@@ -365,6 +373,8 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     } else {
         log::info!("Server monitoring disabled in configuration");
     }
+
+    start_http_server(shutdown_rx_http);
 
     // Main threshold monitoring loop (matching Python's threshold_alerts function)
     let result = threshold_alerts(shutdown_rx_main, config.alerts);
@@ -1126,6 +1136,86 @@ fn start_server_monitor(shutdown_rx: Receiver<()>) {
         }
 
         log::info!("Server monitor thread stopped");
+    });
+}
+
+fn start_http_server(shutdown_rx: Receiver<()>) {
+    thread::spawn(move || {
+        log::info!("Starting HTTP server thread on 127.0.0.1:5667");
+        let server = match tiny_http::Server::http("127.0.0.1:5667") {
+            Ok(server) => server,
+            Err(e) => {
+                log::error!("Failed to start HTTP server: {}", e);
+                return;
+            }
+        };
+
+        // We use try_recv loop to allow graceful shutdown without blocking indefinitely on server.recv()
+        loop {
+            // Check for shutdown signal
+            match shutdown_rx.try_recv() {
+                Ok(_) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    log::info!("Shutdown signal received, stopping HTTP server thread");
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+
+            match server.try_recv() {
+                Ok(Some(mut request)) => {
+                    if request.method().as_str() == "POST" && request.url() == "/notify" {
+                        let mut content = String::new();
+                        if let Err(e) = request.as_reader().read_to_string(&mut content) {
+                            log::warn!("Failed to read request body: {}", e);
+                            let response = tiny_http::Response::from_string("Failed to read body")
+                                .with_status_code(400);
+                            let _ = request.respond(response);
+                            continue;
+                        }
+
+                        match serde_json::from_str::<NotificationRequest>(&content) {
+                            Ok(req) => {
+                                if let Err(e) = notify(&req.title, &req.message) {
+                                    log::error!("Failed to show notification from HTTP API: {}", e);
+                                    let response = tiny_http::Response::from_string(
+                                        "Failed to show notification",
+                                    )
+                                    .with_status_code(500);
+                                    let _ = request.respond(response);
+                                } else {
+                                    log::info!(
+                                        "Successfully handled HTTP notification request: {}",
+                                        req.title
+                                    );
+                                    let response = tiny_http::Response::from_string("OK")
+                                        .with_status_code(200);
+                                    let _ = request.respond(response);
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Invalid JSON in request body: {}", e);
+                                let response = tiny_http::Response::from_string("Invalid JSON")
+                                    .with_status_code(400);
+                                let _ = request.respond(response);
+                            }
+                        }
+                    } else {
+                        let response =
+                            tiny_http::Response::from_string("Not Found").with_status_code(404);
+                        let _ = request.respond(response);
+                    }
+                }
+                Ok(None) => {
+                    // No incoming request right now, sleep a bit to avoid CPU spinning
+                    thread::sleep(time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    log::error!("HTTP server error: {}", e);
+                    thread::sleep(time::Duration::from_secs(1));
+                }
+            }
+        }
+        log::info!("HTTP server thread stopped");
     });
 }
 
