@@ -82,6 +82,10 @@ pub struct NotificationConfig {
     pub new_day_greetings: bool,
     pub server_monitoring: bool,
     pub productivity_score: bool,
+    pub working_hours_start: String,
+    pub working_hours_end: String,
+    pub distractions_thresholds_minutes: Vec<u64>,
+    pub distractions_alerts: bool,
 }
 
 impl Default for NotificationConfig {
@@ -117,6 +121,10 @@ impl Default for NotificationConfig {
             new_day_greetings: true,
             server_monitoring: true,
             productivity_score: true,
+            working_hours_start: "09:00".to_string(),
+            working_hours_end: "17:00".to_string(),
+            distractions_alerts: true,
+            distractions_thresholds_minutes: vec![15, 30, 60],
         }
     }
 }
@@ -311,6 +319,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     let (shutdown_tx_hourly, shutdown_rx_hourly) = bounded::<()>(1);
     let (shutdown_tx_newday, shutdown_rx_newday) = bounded::<()>(1);
     let (shutdown_tx_monitor, shutdown_rx_monitor) = bounded::<()>(1);
+    let (shutdown_tx_distraction, shutdown_rx_distraction) = bounded::<()>(1);
 
     // Setup signal handler for graceful shutdown (handles Ctrl+C, SIGTERM, etc.)
     // This uses the ctrlc crate which provides cross-platform signal handling
@@ -319,6 +328,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
         shutdown_tx_hourly.clone(),
         shutdown_tx_newday.clone(),
         shutdown_tx_monitor.clone(),
+        shutdown_tx_distraction.clone(),
     ];
 
     if let Err(e) = ctrlc::set_handler(move || {
@@ -366,6 +376,16 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
         log::info!("Server monitoring disabled in configuration");
     }
 
+    if config.distractions_alerts {
+        start_distraction_monitor(
+            shutdown_rx_distraction,
+            config.working_hours_start.clone(),
+            config.working_hours_end.clone(),
+            config.distractions_thresholds_minutes.clone(),
+        );
+    } else {
+        log::info!("Unproductivity alerts disabled in configuration");
+    }
     // Main threshold monitoring loop (matching Python's threshold_alerts function)
     let result = threshold_alerts(shutdown_rx_main, config.alerts);
 
@@ -491,6 +511,167 @@ impl CategoryAlert {
     fn status(&self) -> String {
         format!("{}: {}", self.label, to_hms(self.time_spent))
     }
+}
+
+/// Returns whether a category should be treated as a distraction based on its configured class score.
+fn is_distraction_category(category: &str, classes: &[ClassSetting]) -> bool {
+    if category == "All" {
+        return false;
+    }
+
+    let parts: Vec<String> = category.split(" > ").map(|part| part.to_string()).collect();
+
+    get_category_score(&parts, classes) < 0.0
+}
+
+/// Parses a time string in `HH:MM` format into hour and minute values.
+fn parse_hhmm(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.split(':');
+
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+
+    if parts.next().is_some() || hour > 23 || minute > 59 {
+        return None;
+    }
+
+    Some((hour, minute))
+}
+
+/// Returns whether the current local time falls within the configured working-hours window.
+fn is_within_working_hours(start: &str, end: &str) -> bool {
+    let now = Local::now();
+    let current_minutes = now.hour() * 60 + now.minute();
+
+    let Some((start_hour, start_minute)) = parse_hhmm(start) else {
+        log::warn!("Invalid working_hours_start: {}", start);
+        return false;
+    };
+
+    let Some((end_hour, end_minute)) = parse_hhmm(end) else {
+        log::warn!("Invalid working_hours_end: {}", end);
+        return false;
+    };
+
+    let start_minutes = start_hour * 60 + start_minute;
+    let end_minutes = end_hour * 60 + end_minute;
+
+    if start_minutes <= end_minutes {
+        current_minutes >= start_minutes && current_minutes < end_minutes
+    } else {
+        current_minutes >= start_minutes || current_minutes < end_minutes
+    }
+}
+
+/// Calculates today's total distraction time and returns a category-level breakdown sorted by time spent.
+fn calculate_distraction_time_today() -> Result<(Duration, Vec<(String, f64)>)> {
+    let raw_cat_time = get_time(None, CategoryAggregation::None)?;
+    let classes = get_server_classes_settings();
+
+    if classes.is_empty() {
+        return Ok((Duration::zero(), Vec::new()));
+    }
+
+    let mut total_seconds = 0.0;
+    let mut breakdown: Vec<(String, f64)> = Vec::new();
+
+    for (category, seconds) in raw_cat_time {
+        if category == "All" {
+            continue;
+        }
+
+        if is_distraction_category(&category, &classes) {
+            total_seconds += seconds;
+            breakdown.push((category, seconds));
+        }
+    }
+
+    breakdown.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(cmpOrdering::Equal));
+
+    Ok((Duration::seconds(total_seconds as i64), breakdown))
+}
+
+/// Starts a background monitor that checks distraction time during working hours and sends threshold notifications.
+fn start_distraction_monitor(
+    shutdown_rx: Receiver<()>,
+    working_hours_start: String,
+    working_hours_end: String,
+    thresholds_minutes: Vec<u64>,
+) {
+    thread::spawn(move || {
+        log::info!("Starting distraction monitor thread");
+
+        let mut thresholds: Vec<Duration> = thresholds_minutes
+            .into_iter()
+            .map(|minutes| Duration::minutes(minutes as i64))
+            .collect();
+
+        thresholds.sort();
+
+        let mut max_triggered = Duration::zero();
+
+        loop {
+            if is_within_working_hours(&working_hours_start, &working_hours_end) {
+                match calculate_distraction_time_today() {
+                    Ok((time_spent, breakdown)) => {
+                        for threshold in thresholds.iter().rev() {
+                            if *threshold > max_triggered && time_spent >= *threshold {
+                                max_triggered = *threshold;
+
+                                let mut message =
+                                    format!("Distraction time: {}", to_hms(time_spent));
+
+                                if !breakdown.is_empty() {
+                                    let details = breakdown
+                                        .iter()
+                                        .take(5)
+                                        .map(|(category, seconds)| {
+                                            format!(
+                                                "- {}: {}",
+                                                decode_unicode_escapes(category),
+                                                to_hms(Duration::seconds(*seconds as i64))
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+
+                                    message = format!("{}\n{}", message, details);
+                                }
+
+                                if let Err(e) = notify("Too much distraction", &message) {
+                                    log::error!("Failed to send distraction notification: {}", e);
+                                }
+
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to calculate distraction time: {}", e);
+                    }
+                }
+            } else {
+                // Reset daily working-hours threshold state outside working hours.
+                max_triggered = Duration::zero();
+            }
+
+            match shutdown_rx.recv_timeout(time::Duration::from_secs(60)) {
+                Ok(_) => {
+                    log::info!("Shutdown signal received, stopping distraction monitor thread");
+                    break;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    log::warn!(
+                        "Shutdown channel disconnected, stopping distraction monitor thread"
+                    );
+                    break;
+                }
+            }
+        }
+
+        log::info!("Distraction monitor thread stopped");
+    });
 }
 
 fn threshold_alerts(shutdown_rx: Receiver<()>, alert_configs: Vec<AlertConfig>) -> Result<()> {
