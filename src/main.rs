@@ -74,14 +74,30 @@ impl Default for AlertConfig {
     }
 }
 
+fn default_working_hours_schedule() -> String {
+    "Mon-Fri 09:00-17:00".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationConfig {
     pub alerts: Vec<AlertConfig>,
+    #[serde(default = "default_true")]
     pub hourly_checkins: bool,
+    #[serde(default = "default_true")]
     pub new_day_greetings: bool,
+    #[serde(default = "default_true")]
     pub server_monitoring: bool,
+    #[serde(default = "default_true")]
     pub productivity_score: bool,
+    #[serde(default = "default_working_hours_schedule")]
+    pub working_hours_schedule: String,
+    #[serde(default = "default_true")]
+    pub distractions_alerts: bool,
 }
 
 impl Default for NotificationConfig {
@@ -117,6 +133,8 @@ impl Default for NotificationConfig {
             new_day_greetings: true,
             server_monitoring: true,
             productivity_score: true,
+            working_hours_schedule: default_working_hours_schedule(),
+            distractions_alerts: default_true(),
         }
     }
 }
@@ -205,7 +223,17 @@ fn load_config(custom_path: Option<std::path::PathBuf>) -> Result<NotificationCo
         .map_err(|e| anyhow!("Failed to read config file {:?}: {}", config_path, e))?;
 
     let config: NotificationConfig = toml::from_str(&config_content)
-        .map_err(|e| anyhow!("Failed to parse config file {:?}: {}", config_path, e))?;
+        .unwrap_or_else(|e| panic!("Malformed config {:?}: {}", config_path, e));
+
+    let updated = toml::to_string_pretty(&config)
+        .map_err(|e| anyhow!("Failed to serialize config: {}", e))?;
+
+    if updated != config_content {
+        //missing some top-level fields
+        fs::write(&config_path, &updated)
+            .map_err(|e| anyhow!("Failed to update config {:?}: {}", config_path, e))?;
+        log::info!("Config updated with new defaults at {:?}", config_path);
+    }
 
     log::info!("Loaded configuration from {:?}", config_path);
     Ok(config)
