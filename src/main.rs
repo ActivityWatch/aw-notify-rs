@@ -247,6 +247,15 @@ fn main() -> Result<()> {
 
     log::info!("Starting...");
 
+    if let Err(e) = run_app(cli) {
+        log::error!("Fatal error: {}", e);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn run_app(cli: Cli) -> Result<()> {
     // Set global output-only flag
     OUTPUT_ONLY.store(cli.output_only, Ordering::Relaxed);
 
@@ -330,6 +339,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     let (shutdown_tx_hourly, shutdown_rx_hourly) = bounded::<()>(1);
     let (shutdown_tx_newday, shutdown_rx_newday) = bounded::<()>(1);
     let (shutdown_tx_monitor, shutdown_rx_monitor) = bounded::<()>(1);
+    let (shutdown_tx_distraction, shutdown_rx_distraction) = bounded::<()>(1);
 
     // Setup signal handler for graceful shutdown (handles Ctrl+C, SIGTERM, etc.)
     // This uses the ctrlc crate which provides cross-platform signal handling
@@ -338,6 +348,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
         shutdown_tx_hourly.clone(),
         shutdown_tx_newday.clone(),
         shutdown_tx_monitor.clone(),
+        shutdown_tx_distraction.clone(),
     ];
 
     if let Err(e) = ctrlc::set_handler(move || {
@@ -385,6 +396,15 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
         log::info!("Server monitoring disabled in configuration");
     }
 
+    if config.distractions_alerts {
+        start_distraction_monitor(
+            shutdown_rx_distraction,
+            config.working_hours_schedule.clone(),
+            vec![15, 30, 60],
+        );
+    } else {
+        log::info!("Unproductivity alerts disabled in configuration");
+    }
     // Main threshold monitoring loop (matching Python's threshold_alerts function)
     let result = threshold_alerts(shutdown_rx_main, config.alerts);
 
@@ -510,6 +530,245 @@ impl CategoryAlert {
     fn status(&self) -> String {
         format!("{}: {}", self.label, to_hms(self.time_spent))
     }
+}
+
+/// Returns whether a category should be treated as a distraction based on its configured class score.
+fn is_distraction_category(category: &str, classes: &[ClassSetting]) -> bool {
+    if category == "All" {
+        return false;
+    }
+
+    get_category_score(category, classes) < 0.0
+}
+
+fn parse_hhmm(value: &str) -> Option<(u32, u32)> {
+    let mut parts = value.split(':');
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 {
+        return None;
+    }
+    Some((hour, minute))
+}
+
+fn parse_weekday(s: &str) -> Option<u32> {
+    let b = s.as_bytes();
+    let len = b.len();
+    if !(3..=9).contains(&len) {
+        return None;
+    }
+    let mut lower = [0u8; 9];
+    for i in 0..len {
+        lower[i] = b[i].to_ascii_lowercase();
+    }
+    match &lower[..len] {
+        b"mon" | b"monday" => Some(0),
+        b"tue" | b"tuesday" => Some(1),
+        b"wed" | b"wednesday" => Some(2),
+        b"thu" | b"thursday" => Some(3),
+        b"fri" | b"friday" => Some(4),
+        b"sat" | b"saturday" => Some(5),
+        b"sun" | b"sunday" => Some(6),
+        _ => None,
+    }
+}
+
+/// Parses a day spec into a 7-element bitmask (index 0 = Monday).
+/// Accepts: `*`, single days (`Mon`), ranges (`Mon-Fri`), and comma lists (`Mon,Wed,Fri`).
+fn parse_day_spec(spec: &str) -> Option<[bool; 7]> {
+    if spec == "*" {
+        return Some([true; 7]);
+    }
+
+    let mut days = [false; 7];
+
+    for part in spec.split(',') {
+        let part = part.trim();
+        if let Some(dash) = part.find('-') {
+            let start = parse_weekday(&part[..dash])?;
+            let end = parse_weekday(&part[dash + 1..])?;
+            if start <= end {
+                for d in start..=end {
+                    days[d as usize] = true;
+                }
+            } else {
+                // Wrap-around range e.g. "Fri-Mon"
+                for d in start..7 {
+                    days[d as usize] = true;
+                }
+                for d in 0..=end {
+                    days[d as usize] = true;
+                }
+            }
+        } else {
+            let d = parse_weekday(part)?;
+            days[d as usize] = true;
+        }
+    }
+
+    Some(days)
+}
+
+struct ParsedSchedule {
+    active_days: [bool; 7],
+    start_minutes: u32,
+    end_minutes: u32,
+}
+
+/// Parses a schedule string into a `ParsedSchedule`.
+///
+/// Format: `"<days> <HH:MM>-<HH:MM>"`, e.g. `"Mon-Fri 09:00-17:00"`.
+fn parse_schedule(schedule: &str) -> Option<ParsedSchedule> {
+    let (day_spec, time_spec) = schedule.split_once(' ')?;
+    let active_days = parse_day_spec(day_spec)?;
+    let (start_str, end_str) = time_spec.split_once('-')?;
+    let (start_h, start_m) = parse_hhmm(start_str)?;
+    let (end_h, end_m) = parse_hhmm(end_str)?;
+    Some(ParsedSchedule {
+        active_days,
+        start_minutes: start_h * 60 + start_m,
+        end_minutes: end_h * 60 + end_m,
+    })
+}
+
+/// Returns whether the current local time falls within a pre-parsed schedule.
+/// Overnight ranges (end < start) are supported, e.g. 22:00-06:00.
+fn is_within_schedule(schedule: &ParsedSchedule) -> bool {
+    let now = Local::now();
+    let current_day = now.weekday().num_days_from_monday() as usize;
+
+    if !schedule.active_days[current_day] {
+        return false;
+    }
+
+    let current_minutes = now.hour() * 60 + now.minute();
+
+    if schedule.start_minutes <= schedule.end_minutes {
+        current_minutes >= schedule.start_minutes && current_minutes < schedule.end_minutes
+    } else {
+        current_minutes >= schedule.start_minutes || current_minutes < schedule.end_minutes
+    }
+}
+
+/// Calculates today's total distraction time and returns a category-level breakdown sorted by time spent.
+fn calculate_distraction_time_today() -> Result<(Duration, Vec<(String, f64)>)> {
+    let raw_cat_time = get_time(None, CategoryAggregation::None)?;
+    let classes = get_server_classes_settings();
+
+    if classes.is_empty() {
+        return Ok((Duration::zero(), Vec::new()));
+    }
+
+    let mut total_seconds = 0.0;
+    let mut breakdown: Vec<(String, f64)> = Vec::new();
+
+    for (category, seconds) in raw_cat_time {
+        if category == "All" {
+            continue;
+        }
+
+        if is_distraction_category(&category, &classes) {
+            total_seconds += seconds;
+            breakdown.push((category, seconds));
+        }
+    }
+
+    breakdown.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(cmpOrdering::Equal));
+
+    Ok((Duration::seconds(total_seconds as i64), breakdown))
+}
+
+/// Starts a background monitor that checks distraction time during working hours and sends threshold notifications.
+fn start_distraction_monitor(
+    shutdown_rx: Receiver<()>,
+    schedule: String,
+    thresholds_minutes: Vec<u64>,
+) {
+    thread::spawn(move || {
+        log::info!("Starting distraction monitor thread");
+
+        let schedule = parse_schedule(&schedule)
+            .unwrap_or_else(|| panic!("Invalid working_hours_schedule '{}'", schedule));
+
+        let mut thresholds: Vec<Duration> = thresholds_minutes
+            .into_iter()
+            .map(|minutes| Duration::minutes(minutes as i64))
+            .collect();
+
+        thresholds.sort();
+
+        let mut max_triggered = Duration::zero();
+        let mut next_wake = time::Instant::now() + time::Duration::from_secs(60);
+
+        loop {
+            let now = time::Instant::now();
+            if now.saturating_duration_since(next_wake) > time::Duration::from_secs(5) {
+                next_wake = now + time::Duration::from_secs(60);
+            }
+
+            match shutdown_rx.recv_timeout(next_wake.saturating_duration_since(now)) {
+                Ok(_) => {
+                    log::info!("Shutdown signal received, stopping distraction monitor thread");
+                    break;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    log::warn!(
+                        "Shutdown channel disconnected, stopping distraction monitor thread"
+                    );
+                    break;
+                }
+            }
+
+            next_wake += time::Duration::from_secs(60);
+
+            if is_within_schedule(&schedule) {
+                match calculate_distraction_time_today() {
+                    Ok((time_spent, breakdown)) => {
+                        for threshold in thresholds.iter().rev() {
+                            if *threshold > max_triggered && time_spent >= *threshold {
+                                max_triggered = *threshold;
+
+                                let mut message =
+                                    format!("Distraction time: {}", to_hms(time_spent));
+
+                                if !breakdown.is_empty() {
+                                    let details = breakdown
+                                        .iter()
+                                        .take(5)
+                                        .map(|(category, seconds)| {
+                                            format!(
+                                                "- {}: {}",
+                                                category,
+                                                to_hms(Duration::seconds(*seconds as i64))
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+
+                                    message = format!("{}\n{}", message, details);
+                                }
+
+                                if let Err(e) = notify("Too much distraction", &message) {
+                                    log::error!("Failed to send distraction notification: {}", e);
+                                }
+
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to calculate distraction time: {}", e);
+                    }
+                }
+            } else {
+                // Reset daily working-hours threshold state outside working hours.
+                max_triggered = Duration::zero();
+            }
+        }
+
+        log::info!("Distraction monitor thread stopped");
+    });
 }
 
 fn threshold_alerts(shutdown_rx: Receiver<()>, alert_configs: Vec<AlertConfig>) -> Result<()> {
@@ -755,8 +1014,19 @@ RETURN = {{"duration": duration, "cat_events": cat_events}};"#,
     Ok(cat_time)
 }
 
-fn get_category_score(name: &[String], classes: &[ClassSetting]) -> f64 {
-    if let Some(class) = classes.iter().find(|c| c.name == name) {
+fn matches_category(class_name: &[String], cat_name: &str) -> bool {
+    let mut parts = cat_name.split(" > ");
+    for expected in class_name {
+        match parts.next() {
+            Some(actual) if actual == expected => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
+}
+
+fn get_category_score(name: &str, classes: &[ClassSetting]) -> f64 {
+    if let Some(class) = classes.iter().find(|c| matches_category(&c.name, name)) {
         if let Some(data) = &class.data {
             if let Some(score_val) = data.get("score") {
                 if let Some(score_f64) = score_val.as_f64() {
@@ -770,8 +1040,7 @@ fn get_category_score(name: &[String], classes: &[ClassSetting]) -> f64 {
             }
         }
     }
-    if name.len() > 1 {
-        let parent_name = &name[0..name.len() - 1];
+    if let Some((parent_name, _)) = name.rsplit_once(" > ") {
         return get_category_score(parent_name, classes);
     }
     0.0
@@ -794,8 +1063,7 @@ fn calculate_productivity_score(date: Option<DateTime<Utc>>) -> Result<Option<(f
             continue;
         }
         total_time += duration_sec;
-        let parts: Vec<String> = cat_name.split(" > ").map(|s| s.to_string()).collect();
-        let score = get_category_score(&parts, &classes);
+        let score = get_category_score(cat_name, &classes);
         let cat_score = (duration_sec / 3600.0) * score;
         total_score += cat_score;
         if cat_score > 0.0 {
@@ -822,7 +1090,7 @@ fn send_checkin(title: &str, date: Option<DateTime<Utc>>) -> Result<()> {
     if !top_categories.is_empty() {
         let message = top_categories
             .iter()
-            .map(|(cat, time)| format!("- {}: {}", decode_unicode_escapes(cat), time))
+            .map(|(cat, time)| format!("- {}: {}", cat, time))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -845,7 +1113,7 @@ fn send_detailed_checkin(title: &str, date: Option<DateTime<Utc>>) -> Result<()>
     if !top_categories.is_empty() {
         let message = top_categories
             .iter()
-            .map(|(cat, time)| format!("- {}: {}", decode_unicode_escapes(cat), time))
+            .map(|(cat, time)| format!("- {}: {}", cat, time))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -889,7 +1157,7 @@ fn send_initial_checkins(productivity_score: bool) -> Result<()> {
         if !top_categories_yesterday.is_empty() {
             let message_yesterday = top_categories_yesterday
                 .iter()
-                .map(|(cat, time)| format!("- {}: {}", decode_unicode_escapes(cat), time))
+                .map(|(cat, time)| format!("- {}: {}", cat, time))
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -911,7 +1179,7 @@ fn send_initial_checkins(productivity_score: bool) -> Result<()> {
         if !top_categories_today.is_empty() {
             let message_today = top_categories_today
                 .iter()
-                .map(|(cat, time)| format!("- {}: {}", decode_unicode_escapes(cat), time))
+                .map(|(cat, time)| format!("- {}: {}", cat, time))
                 .collect::<Vec<_>>()
                 .join("\n");
 
@@ -1329,12 +1597,6 @@ fn to_hms(duration: Duration) -> String {
     }
 
     parts.join(" ")
-}
-
-fn decode_unicode_escapes(s: &str) -> String {
-    // Simple implementation for now - matches Python's decode_unicode_escapes
-    // Could be enhanced to handle actual Unicode escape sequences
-    s.to_string()
 }
 
 // === CATEGORY MATCHING AND PROCESSING FUNCTIONS ===
