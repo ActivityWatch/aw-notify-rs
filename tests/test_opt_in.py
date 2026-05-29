@@ -29,10 +29,12 @@ ALERT_TYPES = {
     "new_day",
     "server_status",
     "external",
+    "distraction",
 }
 QUIET_CONFIG = {
     "alerts": [],
     "hourly_checkins": False,
+    "distractions_alerts": False,
     "new_day_greetings": False,
     "productivity_score": False,
     "server_monitoring": False,
