@@ -10,28 +10,7 @@ env:
   PROJECT_NAME: aw-notify
 
 jobs:
-  create-release:
-    runs-on: ubuntu-24.04
-    outputs:
-      upload_url: ${{ steps.get_upload_url.outputs.url }}
-    steps:
-      - name: Release
-        uses: softprops/action-gh-release@v2
-        if: github.ref_type == 'tag'
-        with:
-          generate_release_notes: true
-          files: |
-            dist/*
-
-      - name: Get Upload URL
-        id: get_upload_url
-        run: |
-          echo "url=$(gh api repos/${{ github.repository }}/releases/tags/${{ github.ref_name }} --jq '.upload_url')" >> $GITHUB_OUTPUT
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   build-linux-x64:
-    needs: create-release
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -55,14 +34,13 @@ jobs:
           tar -czf ${{ env.PROJECT_NAME }}-linux-x64.tar.gz ${{ env.PROJECT_NAME }}
           cd -
 
-      - name: Upload Release Asset
-        run: |
-          gh release upload ${{ github.ref_name }} ./target/release/${{ env.PROJECT_NAME }}-linux-x64.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-linux-x64
+          path: ./target/release/${{ env.PROJECT_NAME }}-linux-x64.tar.gz
 
   build-linux-arm64:
-    needs: create-release
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -86,14 +64,13 @@ jobs:
           tar -czf ${{ env.PROJECT_NAME }}-linux-arm64.tar.gz ${{ env.PROJECT_NAME }}
           cd -
 
-      - name: Upload Release Asset
-        run: |
-          gh release upload ${{ github.ref_name }} ./target/release/${{ env.PROJECT_NAME }}-linux-arm64.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-linux-arm64
+          path: ./target/release/${{ env.PROJECT_NAME }}-linux-arm64.tar.gz
 
   build-macos-x64:
-    needs: create-release
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -149,20 +126,15 @@ jobs:
           # Create tar.gz as well
           tar -czf ${{ env.PROJECT_NAME }}-macos-x64-app.tar.gz ${{ env.PROJECT_NAME }}.app
 
-      - name: Upload DMG Release Asset
-        run: |
-          gh release upload ${{ github.ref_name }} ./${{ env.PROJECT_NAME }}-macos-x64.dmg
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload App Release Asset
-        run: |
-          gh release upload ${{ github.ref_name }} ./${{ env.PROJECT_NAME }}-macos-x64-app.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-macos-x64
+          path: |
+            ./${{ env.PROJECT_NAME }}-macos-x64.dmg
+            ./${{ env.PROJECT_NAME }}-macos-x64-app.tar.gz
 
   build-macos-arm64:
-    needs: create-release
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -218,20 +190,15 @@ jobs:
           # Create tar.gz as well
           tar -czf ${{ env.PROJECT_NAME }}-macos-arm64-app.tar.gz ${{ env.PROJECT_NAME }}.app
 
-      - name: Upload DMG Release Asset
-        run: |
-          gh release upload ${{ github.ref_name }} ./${{ env.PROJECT_NAME }}-macos-arm64.dmg
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload App Release Asset
-        run: |
-          gh release upload ${{ github.ref_name }} ./${{ env.PROJECT_NAME }}-macos-arm64-app.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-macos-arm64
+          path: |
+            ./${{ env.PROJECT_NAME }}-macos-arm64.dmg
+            ./${{ env.PROJECT_NAME }}-macos-arm64-app.tar.gz
 
   build-windows:
-    needs: create-release
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -250,8 +217,39 @@ jobs:
           7z a -tzip ${{ env.PROJECT_NAME }}-windows-x64.zip ${{ env.PROJECT_NAME }}.exe
           cd -
 
-      - name: Upload Release Asset
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-windows-x64
+          path: ./target/release/${{ env.PROJECT_NAME }}-windows-x64.zip
+
+  release:
+    name: Create Release
+    needs: [build-linux-x64, build-linux-arm64, build-macos-x64, build-macos-arm64, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts directory
         run: |
-          gh release upload ${{ github.ref_name }} ./target/release/${{ env.PROJECT_NAME }}-windows-x64.zip
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          ls -la dist/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            dist/*
