@@ -10,11 +10,17 @@ license = "MPL-2.0"
 keywords = ["activitywatch", "time-tracking", "notifications"]
 categories = ["gui"]
 
+[workspace]
+members = ["crates/aw-notify-client"]
+
 [[bin]]
 name = "aw-notify"
 path = "src/main.rs"
 
 [dependencies]
+# Shared notification client + wire types (also re-used server-side)
+aw-notify-client = { path = "crates/aw-notify-client" }
+
 # ActivityWatch client
 aw-client-rust = {git = "https://github.com/ActivityWatch/aw-server-rust", branch="master"}
 aw-models = { git = "https://github.com/ActivityWatch/aw-server-rust.git", branch = "master" }

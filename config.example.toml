@@ -20,6 +20,11 @@ server_monitoring = true
 # Enable or disable productivity score notification on new day
 productivity_score = true
 
+# Port for the local HTTP API that other modules use to send notifications
+# (POST http://127.0.0.1:<http_port>/notify). See the README section
+# "Sending notifications from other modules".
+http_port = 5667
+
 # Category alerts configuration
 # Each alert monitors a specific category and sends notifications when thresholds are reached
 [[alerts]]
