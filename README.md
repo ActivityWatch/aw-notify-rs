@@ -92,6 +92,75 @@ Options:
   -V, --version      Print version
 ```
 
+## Sending notifications from other modules
+
+While the service is running it exposes a small local HTTP API so other
+ActivityWatch modules (watchers, importers, scripts) can push their own desktop
+notifications through aw-notify. Requests are queued and rate-limited centrally,
+so multiple modules won't spam the user.
+
+### Endpoint
+
+```
+POST http://127.0.0.1:<http_port>/notify        # http_port defaults to 5667
+Content-Type: application/json
+```
+
+Request body:
+
+| Field     | Type   | Required | Notes                                                            |
+|-----------|--------|----------|------------------------------------------------------------------|
+| `title`   | string | yes      | Notification title.                                              |
+| `message` | string | yes      | Notification body.                                               |
+| `sender`  | string | no       | Originating module; shown as `Title (sender)`. Alias: `watcher`. |
+
+Responses:
+
+| Status | Meaning                                                        |
+|--------|---------------------------------------------------------------|
+| `200`  | Queued for display.                                           |
+| `400`  | Invalid or oversized JSON body.                              |
+| `429`  | Notification queue is full — back off and retry later.       |
+| `503`  | Service not ready to accept notifications.                  |
+| `404`  | Wrong path or method.                                       |
+
+The port is configurable via the `http_port` config key (see [Configuration Options](#configuration-options)).
+
+### Quick test with curl
+
+```bash
+curl -s -X POST http://127.0.0.1:5667/notify \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Backup done","message":"Synced 1,234 events","watcher":"my-script"}'
+```
+
+### From Rust: the `aw-notify-client` crate
+
+Rust modules can use the lightweight [`aw-notify-client`](crates/aw-notify-client)
+crate (no TLS/hyper/reqwest pulled in — just `serde` and `ureq`):
+
+```toml
+# Cargo.toml
+[dependencies]
+aw-notify-client = { git = "https://github.com/ActivityWatch/aw-notify-rs", branch = "master" }
+```
+
+```rust
+use aw_notify_client::NotificationClient;
+
+let client = NotificationClient::new().with_sender("aw-watcher-foo");
+match client.notify("Backup done", "Synced 1,234 events") {
+    Ok(()) => {}
+    Err(e) => eprintln!("notify failed: {e}"), // e.g. aw-notify not running, or queue full
+}
+```
+
+A runnable example lives in [`examples/notify_client.rs`](examples/notify_client.rs):
+
+```bash
+cargo run --example notify_client "Build finished" "All tests passed ✅"
+```
+
 ## Category Aggregation
 
 aw-notify-rs supports three different category aggregation modes for analyzing your time:
@@ -218,6 +287,7 @@ The configuration file supports the following options:
 - `hourly_checkins`: Enable/disable hourly activity summaries (default: true)
 - `new_day_greetings`: Enable/disable new day greeting notifications (default: true)
 - `server_monitoring`: Enable/disable ActivityWatch server monitoring alerts (default: true)
+- `http_port`: Port for the local HTTP API that other modules use to send notifications (default: 5667). See [Sending notifications from other modules](#sending-notifications-from-other-modules).
 
 #### Category Alerts
 Configure custom category alerts using the `[[alerts]]` sections:

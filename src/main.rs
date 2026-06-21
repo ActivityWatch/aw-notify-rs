@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering as cmpOrdering;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
@@ -32,6 +32,12 @@ static HOSTNAME: OnceLock<String> = OnceLock::new();
 static SERVER_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static OUTPUT_ONLY: AtomicBool = AtomicBool::new(false);
 static NOTIFICATION_TX: OnceLock<crossbeam_channel::Sender<QueuedNotification>> = OnceLock::new();
+
+// Host/port defaults live in aw-notify-client so the client and server can't
+// drift on where notifications are sent.
+use aw_notify_client::{NotificationRequest, DEFAULT_HOST as HTTP_HOST, DEFAULT_PORT};
+/// Maximum accepted size of an HTTP notification request body, in bytes.
+const MAX_HTTP_BODY_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug)]
 pub struct QueuedNotification {
@@ -90,6 +96,7 @@ pub struct NotificationConfig {
     pub new_day_greetings: bool,
     pub server_monitoring: bool,
     pub productivity_score: bool,
+    pub http_port: u16,
 }
 
 impl Default for NotificationConfig {
@@ -125,16 +132,9 @@ impl Default for NotificationConfig {
             new_day_greetings: true,
             server_monitoring: true,
             productivity_score: true,
+            http_port: DEFAULT_PORT,
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct NotificationRequest {
-    pub title: String,
-    pub message: String,
-    #[serde(alias = "watcher")]
-    pub sender: Option<String>,
 }
 
 #[derive(Parser)]
@@ -324,7 +324,9 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
 
     // Initialize notification queue and worker thread (unbounded queue)
     let (notification_tx, notification_rx) = unbounded::<QueuedNotification>();
-    NOTIFICATION_TX.set(notification_tx).unwrap();
+    NOTIFICATION_TX
+        .set(notification_tx)
+        .map_err(|_| anyhow!("notification channel already initialized"))?;
 
     let (shutdown_tx_worker, shutdown_rx_worker) = bounded::<()>(1);
     start_notification_worker(notification_rx, shutdown_rx_worker);
@@ -392,7 +394,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
         log::info!("Server monitoring disabled in configuration");
     }
 
-    start_http_server(shutdown_rx_http);
+    start_http_server(shutdown_rx_http, config.http_port);
 
     // Main threshold monitoring loop (matching Python's threshold_alerts function)
     let result = threshold_alerts(shutdown_rx_main, config.alerts);
@@ -1157,10 +1159,11 @@ fn start_server_monitor(shutdown_rx: Receiver<()>) {
     });
 }
 
-fn start_http_server(shutdown_rx: Receiver<()>) {
+fn start_http_server(shutdown_rx: Receiver<()>, port: u16) {
     thread::spawn(move || {
-        log::info!("Starting HTTP server thread on 127.0.0.1:5667");
-        let server = match tiny_http::Server::http("127.0.0.1:5667") {
+        let addr = format!("{}:{}", HTTP_HOST, port);
+        log::info!("Starting HTTP server thread on {}", addr);
+        let server = match tiny_http::Server::http(addr.as_str()) {
             Ok(server) => server,
             Err(e) => {
                 log::error!("Failed to start HTTP server: {}", e);
@@ -1181,9 +1184,15 @@ fn start_http_server(shutdown_rx: Receiver<()>) {
 
             match server.try_recv() {
                 Ok(Some(mut request)) => {
-                    if request.method().as_str() == "POST" && request.url() == "/notify" {
+                    // Ignore any query string so e.g. "/notify?foo=bar" still matches.
+                    let path = request.url().split('?').next().unwrap_or("");
+                    if request.method().as_str() == "POST" && path == "/notify" {
                         let mut content = String::new();
-                        if let Err(e) = request.as_reader().read_to_string(&mut content) {
+                        // Cap the body size so a misbehaving local client can't OOM the daemon.
+                        let reader: &mut dyn Read = request.as_reader();
+                        if let Err(e) =
+                            Read::take(reader, MAX_HTTP_BODY_SIZE).read_to_string(&mut content)
+                        {
                             log::warn!("Failed to read request body: {}", e);
                             let response = tiny_http::Response::from_string("Failed to read body")
                                 .with_status_code(400);
@@ -1200,6 +1209,12 @@ fn start_http_server(shutdown_rx: Receiver<()>) {
                                     sender.as_deref().unwrap_or("unknown").to_string();
 
                                 if let Some(tx) = NOTIFICATION_TX.get() {
+                                    // Soft cap to apply backpressure to HTTP senders so a chatty
+                                    // client can't grow the (intentionally unbounded) queue without
+                                    // limit. The len()/send() pair isn't atomic in general, but this
+                                    // HTTP server runs a single-threaded accept loop (see
+                                    // start_http_server), so requests are processed one at a time and
+                                    // this check can never race another HTTP send.
                                     if tx.len() < 10 {
                                         let msg = QueuedNotification {
                                             title: title.clone(),
@@ -1372,10 +1387,12 @@ fn enqueue_notification(title: &str, message: &str, sender: Option<&str>) -> Res
             message: message.to_string(),
             sender: sender.map(|s| s.to_string()),
         };
-        // Blocks if queue is full (ensures backpressure for internal alerts)
+        // The queue is unbounded, so this never blocks; it only errors if the
+        // worker thread has gone away (receiver dropped). Internal alerts are
+        // never dropped — unlike HTTP requests, they aren't subject to a cap.
         if let Err(e) = tx.send(msg) {
             log::error!("Failed to send notification to queue: {}", e);
-            // Fallback to synchronous display if sending fails
+            // Worker is gone; fall back to displaying synchronously.
             return display_notification(title, message, sender);
         }
         Ok(())
@@ -1463,17 +1480,24 @@ fn display_notification(title: &str, message: &str, sender: Option<&str>) -> Res
         log::info!(r#"Showing: "{}\n{}""#, title, message);
     }
 
+    // Attribute the sending module in the visible notification title so
+    // notifications posted over HTTP aren't indistinguishable from internal ones.
+    let display_title = match sender {
+        Some(s) => format!("{} ({})", title, s),
+        None => title.to_string(),
+    };
+
     // Try terminal-notifier first on macOS (like Python)
     #[cfg(target_os = "macos")]
     {
-        if try_terminal_notifier(title, message)? {
+        if try_terminal_notifier(&display_title, message)? {
             return Ok(());
         }
     }
 
     // Fall back to notify-rust (like Python falls back to desktop-notifier)
     Notification::new()
-        .summary(title)
+        .summary(&display_title)
         .body(message)
         .appname("ActivityWatch")
         .timeout(5000)
