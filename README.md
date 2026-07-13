@@ -31,7 +31,7 @@ This is a Rust rewrite of the Python version, organized across multiple modules,
 
 ```bash
 # Clone the repository
-git clone https://github/0xbrayo/aw-notify-rs.git
+git clone https://github.com/ActivityWatch/aw-notify-rs
 cd aw-notify-rs
 
 # Build the application
