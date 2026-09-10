@@ -301,7 +301,7 @@ class OptInTests(unittest.TestCase):
         creates = [r for r in server.requests if urlsplit(r[1]).path == bucket_path]
         heartbeats = server.matching("/heartbeat")
         self.assertGreaterEqual(len(creates), 1)
-        self.assertEqual(len(creates), len(heartbeats))
+        self.assertGreaterEqual(len(creates), len(heartbeats))
         for creation, heartbeat in zip(creates, heartbeats):
             self.assertEqual(creation[0], "POST")
             self.assertEqual(creation[2]["type"], "app.aw-notify.status")

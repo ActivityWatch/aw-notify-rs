@@ -1,6 +1,6 @@
 # aw-notify-rs
 
-A simplified Rust implementation of [aw-notify](https://github.com/ActivityWatch/aw-notify) that matches the Python version's behavior while providing Rust's performance and safety benefits.
+A simplified Rust implementation of [aw-notify](https://github.com/ActivityWatch/aw-notify) with opt-in delivery and native desktop notifications.
 
 ## Overview
 
@@ -53,7 +53,9 @@ means false even if the local file says true. Existing local fallback behavior
 still applies when the server setting is absent, unreadable, or malformed.
 
 All commands, including `checkin`, `checkin-detailed`, and `--output-only`, honor
-this flag. A disabled launch exits successfully before querying activity,
+this flag. The server must be reachable to read the authoritative opt-in setting; connection
+failures remain errors. Once settings are loaded, a disabled launch exits
+successfully before querying activity,
 starting the HTTP listener, creating a bucket, or sending notifications.
 Configuration is read at launch; restart the process after changing settings.
 Managers and their tray toggles are configured separately.
@@ -468,7 +470,7 @@ If no configuration file is found, the application uses these default alerts:
 - **Editing Configuration**: After the initial run, you can edit the generated configuration file to customize your alerts and preferences.
 
 ## Compatibility
-- **100% behavioral compatibility** with Python version
+- **Notification features** from the Python version, with delivery now opt-in
 - **Identical queries** and time calculations
 - **Same notification logic** and message formatting
 - **Matching cache behavior** and error handling
