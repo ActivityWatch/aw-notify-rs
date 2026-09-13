@@ -20,7 +20,7 @@ pub fn get_log_dir() -> Result<PathBuf> {
         dir.push("aw-notify");
         dir.push("log");
         fs::create_dir_all(&dir)?;
-        return Ok(dir);
+        Ok(dir)
     }
 
     #[cfg(target_os = "windows")]
@@ -31,7 +31,7 @@ pub fn get_log_dir() -> Result<PathBuf> {
         dir.push("Logs");
         dir.push("aw-notify");
         fs::create_dir_all(&dir)?;
-        return Ok(dir);
+        Ok(dir)
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
