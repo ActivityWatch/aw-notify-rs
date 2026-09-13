@@ -1582,11 +1582,6 @@ fn try_terminal_notifier(title: &str, message: &str) -> Result<bool> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn try_terminal_notifier(_title: &str, _message: &str) -> Result<bool> {
-    Ok(false)
-}
-
 fn to_hms(duration: Duration) -> String {
     let days = duration.num_days();
     let hours = duration.num_hours() % 24;
