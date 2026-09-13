@@ -1,12 +1,12 @@
 # aw-notify-rs
 
-A simplified Rust implementation of [aw-notify](https://github.com/ActivityWatch/aw-notify) that matches the Python version's behavior while providing Rust's performance and safety benefits.
+A simplified Rust implementation of [aw-notify](https://github.com/ActivityWatch/aw-notify) with opt-in delivery and native desktop notifications.
 
 ## Overview
 
 This is a Rust rewrite of the Python version, organized across multiple modules, while maintaining:
 
-- ✅ **Identical behavior** to the Python implementation
+- ✅ **Opt-in delivery** for every command
 - ✅ **Type safety** and memory safety of Rust
 - ✅ **Zero runtime overhead** with native compilation
 - ✅ **Simple architecture** that's easy to understand and maintain
@@ -42,10 +42,28 @@ cargo build --release
 
 ## Usage
 
+### Opt in before starting
+
+Notifications default to **disabled**, including existing configurations without
+an `enabled` key. Set `enabled` to `true` in `/api/0/settings/aw-notify`, preserving
+other settings in that object. If that setting is absent, set `enabled = true`
+in the local TOML configuration (or the file passed with `--config`). A server
+configuration replaces the local file wholesale: a missing server `enabled` key
+means false even if the local file says true. Existing local fallback behavior
+still applies when the server setting is absent, unreadable, or malformed.
+
+All commands, including `checkin`, `checkin-detailed`, and `--output-only`, honor
+this flag. The server must be reachable to read the authoritative opt-in setting; connection
+failures remain errors. Once settings are loaded, a disabled launch exits
+successfully before querying activity,
+starting the HTTP listener, creating a bucket, or sending notifications.
+Configuration is read at launch; restart the process after changing settings.
+Managers and their tray toggles are configured separately.
+
 ### Starting the notification service
 
 ```bash
-# Start with default settings
+# Start after opting in
 ./target/release/aw-notify start
 
 # Start in testing mode (connects to port 5666)
@@ -452,7 +470,7 @@ If no configuration file is found, the application uses these default alerts:
 - **Editing Configuration**: After the initial run, you can edit the generated configuration file to customize your alerts and preferences.
 
 ## Compatibility
-- **100% behavioral compatibility** with Python version
+- **Notification features** from the Python version, with delivery now opt-in
 - **Identical queries** and time calculations
 - **Same notification logic** and message formatting
 - **Matching cache behavior** and error handling
@@ -492,3 +510,67 @@ This project is licensed under the Mozilla Public License 2.0 (MPL-2.0), the sam
 ## Acknowledgments
 
 This is a simplified rewrite of the original [aw-notify](https://github.com/ActivityWatch/aw-notify) Python implementation by Erik Bjäreholt and the ActivityWatch team, designed to match its behavior exactly while providing Rust's performance and safety benefits.
+
+## Liveness and delivery counters
+
+An enabled `start` process writes immediately, then every 5 seconds, to the local
+ActivityWatch bucket `aw-notify_<hostname>` (type `app.aw-notify.status`, client
+`aw-notify`). Heartbeats use a 10-second pulsetime. The worker runs independently
+of alert checks, including when `alerts` is empty. One-shot checkins do not emit
+liveness. Stopping or disabling the daemon leaves historical events intact;
+consumers should determine freshness from the last event's **timestamp plus
+duration**, because unchanged heartbeats merge. A 15-second freshness threshold
+allows a missed pulse. Freshness reports process liveness, not successful queries
+or proof that a human saw a notification.
+
+Each event starts with zero duration and has this data shape (all six alert types
+are always present):
+
+```json
+{
+  "schema_version": 1,
+  "enabled": true,
+  "session_started": "2026-09-10T00:00:00Z",
+  "output_only": false,
+  "counts": {
+    "threshold": {"shown": 0, "forwarded": 0, "dismissed": null},
+    "checkin": {"shown": 0, "forwarded": 0, "dismissed": null},
+    "productivity_score": {"shown": 0, "forwarded": 0, "dismissed": null},
+    "new_day": {"shown": 0, "forwarded": 0, "dismissed": null},
+    "server_status": {"shown": 0, "forwarded": 0, "dismissed": null},
+    "external": {"shown": 0, "forwarded": 0, "dismissed": null}
+  }
+}
+```
+
+- `shown`: successful desktop backend submissions (`notify-rust` or macOS
+  `terminal-notifier`), counted after success, not on enqueue. This is not proof
+  of visual presentation or attention; the OS may suppress notifications.
+- `forwarded`: successfully written/flushed JSON notifications in `--output-only`
+  mode. Downstream presentation is unobserved, so these do not increment `shown`.
+- `dismissed`: `null` on every currently supported backend. No dismissal callback
+  is collected. Expiration, failed delivery, and missing observations never count
+  as user dismissals or as measured zero dismissals. These data cannot yet support
+  a dismissal-rate or ignored-notification calculation.
+- Counts are cumulative within `session_started` and reset on process restart,
+  not at midnight. Do not sum snapshots; compare deltas within the same session.
+  A process killed before its next heartbeat may lose its final counter updates.
+- Types group category thresholds, time checkins (including startup summaries),
+  productivity scores, new-day greetings, server availability changes, and HTTP
+  requests respectively. Titles, message bodies, and caller names are not stored
+  in this bucket.
+
+Bucket creation is retried idempotently with each pulse. Network failures are
+logged and retried on the next interval; the pinned ActivityWatch client does not
+surface HTTP status failures on writes, so bucket freshness is the success signal.
+
+### Tests
+
+```bash
+cargo test --workspace --locked
+cargo build --locked
+python3 tests/test_opt_in.py -v
+```
+
+The integration suite uses a loopback mock ActivityWatch API and output-only mode;
+it never sends real desktop notifications.

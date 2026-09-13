@@ -26,6 +26,12 @@ use std::time;
 
 mod dirs;
 mod logging;
+mod telemetry;
+
+use telemetry::{AlertType, Telemetry};
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
+static TELEMETRY: Lazy<Telemetry> = Lazy::new(Telemetry::new);
 
 static AW_CLIENT: OnceLock<aw_client_rust::blocking::AwClient> = OnceLock::new();
 static HOSTNAME: OnceLock<String> = OnceLock::new();
@@ -41,6 +47,7 @@ const MAX_HTTP_BODY_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug)]
 pub struct QueuedNotification {
+    pub alert_type: AlertType,
     pub title: String,
     pub message: String,
     pub sender: Option<String>,
@@ -91,6 +98,7 @@ impl Default for AlertConfig {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotificationConfig {
+    pub enabled: bool,
     pub alerts: Vec<AlertConfig>,
     pub hourly_checkins: bool,
     pub new_day_greetings: bool,
@@ -102,6 +110,7 @@ pub struct NotificationConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             alerts: vec![
                 AlertConfig {
                     category: "All".to_string(),
@@ -287,82 +296,46 @@ fn run_app(cli: Cli) -> Result<()> {
     // Set global output-only flag
     OUTPUT_ONLY.store(cli.output_only, Ordering::Relaxed);
 
-    // Handle commands (matching Python's main function logic)
-    match cli.command.unwrap_or(Commands::Start) {
-        Commands::Start => {
-            // Load configuration
-            let config = load_config(cli.config.clone())?;
+    // All entry points share the same opt-in gate, including manual checkins.
+    let command = cli.command.unwrap_or(Commands::Start);
+    let testing = cli.testing
+        || matches!(
+            command,
+            Commands::Checkin { testing: true } | Commands::CheckinDetailed { testing: true }
+        );
+    let port = cli.port.unwrap_or(if testing { 5666 } else { 5600 });
+    let config = load_config(cli.config)?;
+    let client_name = match command {
+        Commands::Start => "aw-notify",
+        _ => "aw-notify-checkin",
+    };
+    let client = aw_client_rust::blocking::AwClient::new("127.0.0.1", port, client_name)
+        .map_err(|e| anyhow!("Failed to create client: {}", e))?;
+    client.get_info()?;
+    let config = try_load_server_config(&client, config);
+    if !config.enabled {
+        log::info!("Notifications disabled; set enabled = true in aw-notify settings to opt in");
+        return Ok(());
+    }
 
-            // Initialize client (matching Python's start function)
-            let port = cli.port.unwrap_or(if cli.testing { 5666 } else { 5600 });
-            let host = "127.0.0.1";
-            let client = match aw_client_rust::blocking::AwClient::new(host, port, "aw-notify") {
-                Ok(client) => client,
-                Err(e) => return Err(anyhow!("Failed to create client: {}", e)),
-            };
+    let hostname = get_hostname()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    AW_CLIENT.set(client).ok();
+    HOSTNAME.set(hostname.clone()).ok();
+    ENABLED.store(true, Ordering::Relaxed);
 
-            // Wait for server to be ready (like Python's wait_for_start)
-            client.get_info()?;
-
-            // Override local TOML with server config when available.
-            let config = try_load_server_config(&client, config);
-
-            let hostname = get_hostname()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
-
-            // Set global state
-            AW_CLIENT.set(client).ok();
-            HOSTNAME.set(hostname.clone()).ok();
-
-            start_service(hostname, config)
-        }
-        Commands::Checkin { testing } => {
-            // Initialize client for checkin (matching Python's checkin function)
-            let port = cli.port.unwrap_or(if testing { 5666 } else { 5600 });
-            let host = "127.0.0.1";
-            let client =
-                match aw_client_rust::blocking::AwClient::new(host, port, "aw-notify-checkin") {
-                    Ok(client) => client,
-                    Err(e) => return Err(anyhow!("Failed to create client: {}", e)),
-                };
-
-            let hostname = get_hostname()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
-
-            // Set global state
-            AW_CLIENT.set(client).ok();
-            HOSTNAME.set(hostname).ok();
-
-            send_checkin("Time today", None)?;
-            Ok(())
-        }
-        Commands::CheckinDetailed { testing } => {
-            // Initialize client for detailed checkin
-            let port = cli.port.unwrap_or(if testing { 5666 } else { 5600 });
-            let host = "127.0.0.1";
-            let client =
-                match aw_client_rust::blocking::AwClient::new(host, port, "aw-notify-checkin") {
-                    Ok(client) => client,
-                    Err(e) => return Err(anyhow!("Failed to create client: {}", e)),
-                };
-
-            let hostname = get_hostname()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
-
-            // Set global state
-            AW_CLIENT.set(client).ok();
-            HOSTNAME.set(hostname).ok();
-
-            send_detailed_checkin("Detailed Time Summary", None)?;
-            Ok(())
-        }
+    match command {
+        Commands::Start => start_service(hostname, config),
+        Commands::Checkin { .. } => send_checkin("Time today", None),
+        Commands::CheckinDetailed { .. } => send_detailed_checkin("Detailed Time Summary", None),
     }
 }
 
 fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
     log::info!("Starting notification service...");
 
     // Initialize notification queue and worker thread (unbounded queue)
@@ -380,6 +353,14 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     let (shutdown_tx_newday, shutdown_rx_newday) = bounded::<()>(1);
     let (shutdown_tx_monitor, shutdown_rx_monitor) = bounded::<()>(1);
     let (shutdown_tx_http, shutdown_rx_http) = bounded::<()>(1);
+    let (shutdown_tx_heartbeat, shutdown_rx_heartbeat) = bounded::<()>(1);
+    telemetry::start(
+        AW_CLIENT.get().expect("AW_CLIENT not initialized"),
+        &hostname,
+        &TELEMETRY,
+        OUTPUT_ONLY.load(Ordering::Relaxed),
+        shutdown_rx_heartbeat,
+    );
 
     // Setup signal handler for graceful shutdown (handles Ctrl+C, SIGTERM, etc.)
     // This uses the ctrlc crate which provides cross-platform signal handling
@@ -390,6 +371,7 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
         shutdown_tx_monitor.clone(),
         shutdown_tx_http.clone(),
         shutdown_tx_worker.clone(),
+        shutdown_tx_heartbeat.clone(),
     ];
 
     if let Err(e) = ctrlc::set_handler(move || {
@@ -404,7 +386,9 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
             e
         );
         // Continue running even if signal handler setup fails
-        return threshold_alerts(shutdown_rx_main, config.alerts);
+        let result = threshold_alerts(shutdown_rx_main, config.alerts);
+        let _ = shutdown_tx_heartbeat.try_send(());
+        return result;
     }
 
     log::debug!("Signal handler installed successfully");
@@ -448,6 +432,8 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
 
     // Main threshold monitoring loop (matching Python's threshold_alerts function)
     let result = threshold_alerts(shutdown_rx_main, config.alerts);
+
+    let _ = shutdown_tx_heartbeat.try_send(());
 
     // Give background threads a moment to finish cleanup
     thread::sleep(time::Duration::from_millis(100));
@@ -559,7 +545,7 @@ impl CategoryAlert {
                         format!("{}: {}", self.label, threshold_str)
                     };
 
-                    if let Err(e) = notify(title, &message) {
+                    if let Err(e) = notify(AlertType::Threshold, title, &message) {
                         log::error!("Failed to send notification: {}", e);
                     }
                 }
@@ -887,7 +873,7 @@ fn send_checkin(title: &str, date: Option<DateTime<Utc>>) -> Result<()> {
             .collect::<Vec<_>>()
             .join("\n");
 
-        notify(title, &message)?;
+        notify(AlertType::Checkin, title, &message)?;
     } else {
         // No time spent
     }
@@ -910,7 +896,7 @@ fn send_detailed_checkin(title: &str, date: Option<DateTime<Utc>>) -> Result<()>
             .collect::<Vec<_>>()
             .join("\n");
 
-        notify(title, &message)?;
+        notify(AlertType::Checkin, title, &message)?;
     } else {
         // No time spent
     }
@@ -927,12 +913,15 @@ fn send_productivity_score_yesterday() -> Result<()> {
     let yesterday = Local::now().with_timezone(&Utc) - Duration::days(1);
     if let Ok(Some((score, percent))) = calculate_productivity_score(Some(yesterday)) {
         let message = format!("{:+.1} ({:.1}% productive)", score, percent);
-        notify("Productivity Score", &message)?;
+        notify(AlertType::ProductivityScore, "Productivity Score", &message)?;
     }
     Ok(())
 }
 
 fn send_initial_checkins(productivity_score: bool) -> Result<()> {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     log::info!("Sending initial checkins (batched)");
 
     let output_only = OUTPUT_ONLY.load(Ordering::Relaxed);
@@ -990,6 +979,9 @@ fn send_initial_checkins(productivity_score: bool) -> Result<()> {
         let mut stdout = io::stdout().lock();
         stdout.write_all(output.as_bytes())?;
         stdout.flush()?;
+        let forwarded = u64::from(!top_categories_yesterday.is_empty())
+            + u64::from(!top_categories_today.is_empty());
+        TELEMETRY.record(AlertType::Checkin, true, forwarded);
     } else {
         // For non-output mode, send separately (UI notifications)
         if let Err(e) = send_checkin_yesterday() {
@@ -1100,7 +1092,7 @@ fn start_new_day(hostname: String, shutdown_rx: Receiver<()>, productivity_score
                         let day_of_week = day.format("%A");
                         let message = format!("It is {}, {}", day_of_week, day);
 
-                        if let Err(e) = notify("New day", &message) {
+                        if let Err(e) = notify(AlertType::NewDay, "New day", &message) {
                             log::error!("Failed to send new day notification: {}", e);
                         }
 
@@ -1171,14 +1163,17 @@ fn start_server_monitor(shutdown_rx: Receiver<()>) {
             if current_status != previous_status {
                 if current_status {
                     log::info!("Server is back online");
-                    if let Err(e) =
-                        notify("Server Available", "ActivityWatch server is back online.")
-                    {
+                    if let Err(e) = notify(
+                        AlertType::ServerStatus,
+                        "Server Available",
+                        "ActivityWatch server is back online.",
+                    ) {
                         log::error!("Failed to send server available notification: {}", e);
                     }
                 } else {
                     log::warn!("Server went offline");
                     if let Err(e) = notify(
+                        AlertType::ServerStatus,
                         "Server Unavailable",
                         "ActivityWatch server is down. Data may not be saved!",
                     ) {
@@ -1267,6 +1262,7 @@ fn start_http_server(shutdown_rx: Receiver<()>, port: u16) {
                                     // this check can never race another HTTP send.
                                     if tx.len() < 10 {
                                         let msg = QueuedNotification {
+                                            alert_type: AlertType::External,
                                             title: title.clone(),
                                             message,
                                             sender,
@@ -1426,13 +1422,22 @@ fn check_server_availability() -> bool {
     }
 }
 
-fn notify(title: &str, message: &str) -> Result<()> {
-    enqueue_notification(title, message, None)
+fn notify(alert_type: AlertType, title: &str, message: &str) -> Result<()> {
+    enqueue_notification(alert_type, title, message, None)
 }
 
-fn enqueue_notification(title: &str, message: &str, sender: Option<&str>) -> Result<()> {
+fn enqueue_notification(
+    alert_type: AlertType,
+    title: &str,
+    message: &str,
+    sender: Option<&str>,
+) -> Result<()> {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     if let Some(tx) = NOTIFICATION_TX.get() {
         let msg = QueuedNotification {
+            alert_type,
             title: title.to_string(),
             message: message.to_string(),
             sender: sender.map(|s| s.to_string()),
@@ -1443,11 +1448,11 @@ fn enqueue_notification(title: &str, message: &str, sender: Option<&str>) -> Res
         if let Err(e) = tx.send(msg) {
             log::error!("Failed to send notification to queue: {}", e);
             // Worker is gone; fall back to displaying synchronously.
-            return display_notification(title, message, sender);
+            return display_notification(alert_type, title, message, sender);
         }
         Ok(())
     } else {
-        display_notification(title, message, sender)
+        display_notification(alert_type, title, message, sender)
     }
 }
 
@@ -1473,7 +1478,7 @@ fn start_notification_worker(rx: Receiver<QueuedNotification>, shutdown_rx: Rece
                                 last_display = now;
                             }
 
-                            if let Err(e) = display_notification(&msg.title, &msg.message, msg.sender.as_deref()) {
+                            if let Err(e) = display_notification(msg.alert_type, &msg.title, &msg.message, msg.sender.as_deref()) {
                                 log::error!("Error displaying notification: {}", e);
                             }
                         }
@@ -1493,7 +1498,21 @@ fn start_notification_worker(rx: Receiver<QueuedNotification>, shutdown_rx: Rece
     });
 }
 
-fn display_notification(title: &str, message: &str, sender: Option<&str>) -> Result<()> {
+fn display_notification(
+    alert_type: AlertType,
+    title: &str,
+    message: &str,
+    sender: Option<&str>,
+) -> Result<()> {
+    TELEMETRY.deliver(
+        ENABLED.load(Ordering::Relaxed),
+        OUTPUT_ONLY.load(Ordering::Relaxed),
+        alert_type,
+        || display_notification_backend(title, message, sender),
+    )
+}
+
+fn display_notification_backend(title: &str, message: &str, sender: Option<&str>) -> Result<()> {
     let output_only = OUTPUT_ONLY.load(Ordering::Relaxed);
 
     if output_only {
@@ -1859,6 +1878,22 @@ fn get_all_level_categories_for_notifications(
 mod tests {
     use super::*;
 
+    #[test]
+    fn notifications_require_explicit_opt_in() {
+        for json in ["{}", r#"{"enabled":false}"#] {
+            let config: NotificationConfig = serde_json::from_str(json).unwrap();
+            assert!(!config.enabled);
+        }
+        let config: NotificationConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(config.enabled);
+        assert!(!toml::from_str::<NotificationConfig>("").unwrap().enabled);
+        assert!(
+            toml::from_str::<NotificationConfig>("enabled = true")
+                .unwrap()
+                .enabled
+        );
+    }
+
     fn make_alert(category: &str, thresholds: Vec<u64>) -> AlertConfig {
         AlertConfig {
             category: category.to_string(),
@@ -1938,6 +1973,7 @@ mod tests {
     #[test]
     fn test_server_config_overrides_local() {
         let local = NotificationConfig {
+            enabled: true,
             alerts: vec![make_alert("Work", vec![30, 60])],
             hourly_checkins: false,
             new_day_greetings: false,
