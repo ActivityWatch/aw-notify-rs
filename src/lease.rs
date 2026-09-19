@@ -81,12 +81,17 @@ impl Lease {
         }
     }
 
+    // Read-side contract for a monitor process; not consumed by the writer binary
+    // itself, so clippy sees it as dead code here.
+    #[allow(dead_code)]
     /// True if the heartbeat is fresh (now - last < expiry).
     pub fn is_running(&self) -> bool {
         let now = Utc::now();
         (now - self.heartbeat.last).num_seconds() < self.heartbeat.expiry_after_seconds
     }
 
+    // Read-side contract for a monitor process.
+    #[allow(dead_code)]
     /// True if the lease is stale (heartbeat expired) — a hung/crashed process.
     pub fn is_stale(&self) -> bool {
         !self.is_running()
@@ -105,6 +110,8 @@ impl Lease {
         self.delivery_receipt.last_payload = Some(payload);
     }
 
+    // Read-side contract for a monitor process.
+    #[allow(dead_code)]
     /// Mark the capability as cleanly stopped (removes the lease on write).
     pub fn mark_stopped(&mut self) {
         self.effective_state = "stopped".to_string();
@@ -126,6 +133,9 @@ pub fn write_lease(lease: &Lease) -> Result<()> {
     Ok(())
 }
 
+// Read-side contract for a monitor process; the writer binary itself never calls
+// this, so clippy sees it as dead code here.
+#[allow(dead_code)]
 /// Read the lease from disk, if present.
 pub fn read_lease() -> Result<Option<Lease>> {
     let path = lease_path()?;
