@@ -46,3 +46,44 @@ pub fn get_log_dir() -> Result<PathBuf> {
         Ok(dir)
     }
 }
+
+/// Get the state directory for the lease file following ActivityWatch conventions.
+/// Uses `~/.local/state/activitywatch/aw-notify/` on Linux, the data-local dir on
+/// Windows, and `~/Library/Application Support/...` on macOS.
+pub fn get_state_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut dir = ::dirs::state_dir()
+            .or_else(|| {
+                // Fall back to ~/.local/state if the dirs crate can't resolve it
+                ::dirs::home_dir().map(|h| h.join(".local").join("state"))
+            })
+            .ok_or_else(|| anyhow!("Failed to get state dir"))?;
+        dir.push("activitywatch");
+        dir.push("aw-notify");
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut dir =
+            ::dirs::data_local_dir().ok_or_else(|| anyhow!("Failed to get local data dir"))?;
+        dir.push("activitywatch");
+        dir.push("aw-notify");
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        // macOS and other Unix-like systems
+        let mut dir = ::dirs::home_dir().ok_or_else(|| anyhow!("Failed to get home dir"))?;
+        dir.push("Library");
+        dir.push("Application Support");
+        dir.push("activitywatch");
+        dir.push("aw-notify");
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+}

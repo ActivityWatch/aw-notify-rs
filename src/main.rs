@@ -20,17 +20,22 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time;
 
 mod dirs;
+mod lease;
 mod logging;
 
 static AW_CLIENT: OnceLock<aw_client_rust::blocking::AwClient> = OnceLock::new();
 static HOSTNAME: OnceLock<String> = OnceLock::new();
 static SERVER_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static OUTPUT_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Global handle to the capability lease, so the worker thread and main loop
+/// can refresh the heartbeat and record deliveries. Set once at service start.
+static LEASE: OnceLock<Mutex<lease::Lease>> = OnceLock::new();
 static NOTIFICATION_TX: OnceLock<crossbeam_channel::Sender<QueuedNotification>> = OnceLock::new();
 
 // Host/port defaults live in aw-notify-client so the client and server can't
@@ -365,6 +370,17 @@ fn run_app(cli: Cli) -> Result<()> {
 fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
     log::info!("Starting notification service...");
 
+    // Write the background-capability lease: enabled + running, with a fresh
+    // heartbeat. Removed on clean shutdown (see below).
+    let lease = lease::Lease::new("aw-notify", "aw-notify", &hostname);
+    if let Err(e) = lease::write_lease(&lease) {
+        log::warn!(
+            "Failed to write capability lease: {} (continuing anyway)",
+            e
+        );
+    }
+    LEASE.set(Mutex::new(lease)).ok();
+
     // Initialize notification queue and worker thread (unbounded queue)
     let (notification_tx, notification_rx) = unbounded::<QueuedNotification>();
     NOTIFICATION_TX
@@ -451,6 +467,12 @@ fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
 
     // Give background threads a moment to finish cleanup
     thread::sleep(time::Duration::from_millis(100));
+
+    // Clean shutdown: remove the lease so a monitor sees `stopped` (no lease)
+    // rather than `stale`. Best-effort; never fatal.
+    if let Err(e) = lease::remove_lease() {
+        log::warn!("Failed to remove capability lease on shutdown: {}", e);
+    }
 
     log::info!("Shutdown complete");
     result
@@ -620,6 +642,17 @@ fn threshold_alerts(shutdown_rx: Receiver<()>, alert_configs: Vec<AlertConfig>) 
             let status = alert.status();
             if Some(&status) != alert.last_status.as_ref() {
                 alert.last_status = Some(status);
+            }
+        }
+
+        // Refresh the lease heartbeat so a monitor can tell this process is
+        // alive (running) rather than stale. Best-effort; never fatal.
+        if let Some(lease) = LEASE.get() {
+            if let Ok(mut lease) = lease.lock() {
+                lease.touch();
+                if let Err(e) = lease::write_lease(&lease) {
+                    log::warn!("Failed to refresh lease heartbeat: {}", e);
+                }
             }
         }
 
@@ -1552,6 +1585,20 @@ fn display_notification(title: &str, message: &str, sender: Option<&str>) -> Res
         .appname("ActivityWatch")
         .timeout(5000)
         .show()?;
+
+    // Record a successful delivery in the lease (last-successful, not
+    // last-attempted). Best-effort; a failed write must not fail the notify.
+    if let Some(lease) = LEASE.get() {
+        if let Ok(mut lease) = lease.lock() {
+            lease.record_delivery(serde_json::json!({
+                "title": title,
+                "sender": sender,
+            }));
+            if let Err(e) = lease::write_lease(&lease) {
+                log::warn!("Failed to record delivery receipt: {}", e);
+            }
+        }
+    }
 
     Ok(())
 }
