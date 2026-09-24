@@ -1,3 +1,7 @@
+# Notifications are opt-in, including manual checkins and output-only mode.
+# Server /api/0/settings/aw-notify replaces this file when present.
+enabled = false
+
 # aw-notify-rs Configuration File
 #
 # This is an example configuration file for aw-notify-rs.

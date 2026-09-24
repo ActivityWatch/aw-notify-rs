@@ -45,3 +45,8 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
+
+      - name: Test opt-in and heartbeat integration
+        run: |
+          cargo build --locked
+          python3 tests/test_opt_in.py
