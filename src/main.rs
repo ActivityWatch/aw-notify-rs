@@ -737,13 +737,7 @@ fn query_activitywatch(date: Option<DateTime<Utc>>) -> Result<HashMap<String, f6
     let bid_window = format!("aw-watcher-window_{}", hostname);
     let bid_afk = format!("aw-watcher-afk_{}", hostname);
 
-    let always_active_pattern = match client.get_setting("always_active_pattern") {
-        Ok(v) => v.as_str().map(|s| s.to_string()),
-        Err(e) => {
-            log::warn!("Failed to fetch always_active_pattern: {}", e);
-            None
-        }
-    };
+    let always_active_pattern = get_always_active_pattern(client);
 
     let base_params = QueryParamsBase {
         bid_browsers: vec![],
@@ -1381,13 +1375,7 @@ fn get_active_status(hostname: &str) -> Result<Option<bool>> {
     let bid_afk = format!("aw-watcher-afk_{}", hostname);
 
     // Get the always_active_pattern setting
-    let always_active_pattern = match client.get_setting("always_active_pattern") {
-        Ok(v) => v.as_str().map(|s| s.to_string()),
-        Err(e) => {
-            log::debug!("Failed to fetch always_active_pattern: {}", e);
-            None
-        }
-    };
+    let always_active_pattern = get_always_active_pattern(client);
 
     let base_params = QueryParamsBase {
         bid_browsers: vec![],
@@ -1715,6 +1703,26 @@ fn get_server_classes_settings() -> Vec<ClassSetting> {
     classes
 }
 
+/// Fetch the `always_active_pattern` setting, treating an empty/blank pattern as
+/// unset (matching aw-webui). An empty regex matches every window event, which
+/// would count all window time (e.g. macOS `loginwindow` while locked) as active.
+fn get_always_active_pattern(client: &aw_client_rust::blocking::AwClient) -> Option<String> {
+    match client.get_setting("always_active_pattern") {
+        Ok(v) => normalize_always_active_pattern(v.as_str()),
+        Err(e) => {
+            log::warn!("Failed to fetch always_active_pattern: {}", e);
+            None
+        }
+    }
+}
+
+fn normalize_always_active_pattern(pattern: Option<&str>) -> Option<String> {
+    pattern
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 // Get categorization classes from server with fallback to defaults
 fn get_server_classes() -> Vec<(CategoryId, CategorySpec)> {
     let class_settings = get_server_classes_settings();
@@ -1938,6 +1946,17 @@ mod tests {
             toml::from_str::<NotificationConfig>("enabled = true")
                 .unwrap()
                 .enabled
+        );
+    }
+
+    #[test]
+    fn blank_always_active_pattern_is_unset() {
+        assert_eq!(normalize_always_active_pattern(None), None);
+        assert_eq!(normalize_always_active_pattern(Some("")), None);
+        assert_eq!(normalize_always_active_pattern(Some("  ")), None);
+        assert_eq!(
+            normalize_always_active_pattern(Some("zoom.us")),
+            Some("zoom.us".to_string())
         );
     }
 
