@@ -247,8 +247,8 @@ fn load_config(custom_path: Option<std::path::PathBuf>) -> Result<NotificationCo
 /// Unset fields fall back to their `Default` values, not to the local TOML. This is
 /// intentional: the server config is the authoritative complete config, not a patch.
 ///
-/// On any failure (key absent / null response, server unreachable *before*
-/// `get_info()` exits the process, malformed JSON), the local config is returned
+/// On any failure (key absent / null response, server unreachable after the
+/// startup readiness check, malformed JSON), the local config is returned
 /// unchanged.
 fn try_load_server_config(
     client: &aw_client_rust::blocking::AwClient,
@@ -316,7 +316,11 @@ fn run_app(cli: Cli) -> Result<()> {
     };
     let client = aw_client_rust::blocking::AwClient::new("127.0.0.1", port, client_name)
         .map_err(|e| anyhow!("Failed to create client: {}", e))?;
-    client.get_info()?;
+    if matches!(command, Commands::Start) {
+        wait_for_server(&client)?;
+    } else {
+        client.get_info()?;
+    }
     let config = try_load_server_config(&client, config);
     if !config.enabled {
         log::info!("Notifications disabled; set enabled = true in aw-notify settings to opt in");
@@ -335,6 +339,31 @@ fn run_app(cli: Cli) -> Result<()> {
         Commands::Checkin { .. } => send_checkin("Time today", None),
         Commands::CheckinDetailed { .. } => send_detailed_checkin("Detailed Time Summary", None),
     }
+}
+
+/// Managers can launch us before the server is ready. Retry the actual info
+/// request, not just a TCP connection, before reading the shared opt-in setting.
+/// The five attempts use the client's request timeout, with 1/2/4/8s backoff.
+fn wait_for_server(client: &aw_client_rust::blocking::AwClient) -> Result<()> {
+    let mut delay = time::Duration::from_secs(1);
+    for attempt in 1..=5 {
+        match client.get_info() {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt == 5 => {
+                return Err(anyhow!(error)
+                    .context("ActivityWatch server unavailable after 5 startup attempts"));
+            }
+            Err(error) => {
+                log::warn!(
+                    "ActivityWatch server not ready (attempt {attempt}/5): {error}; retrying in {}s",
+                    delay.as_secs()
+                );
+                thread::sleep(delay);
+                delay *= 2;
+            }
+        }
+    }
+    unreachable!("the final attempt always returns")
 }
 
 fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {

@@ -57,12 +57,13 @@ def probe_listener(port, stop, observed):
 
 
 class MockActivityWatch(ThreadingHTTPServer):
-    def __init__(self, settings):
+    def __init__(self, settings, port=0):
         self.settings = settings
         self.requests = []
         self.changed = threading.Condition()
         self.release_heartbeat = None
-        super().__init__(("127.0.0.1", 0), MockHandler)
+        self.info_failures = 0
+        super().__init__(("127.0.0.1", port), MockHandler)
 
     def matching(self, suffix):
         with self.changed:
@@ -95,6 +96,10 @@ class MockHandler(BaseHTTPRequestHandler):
             )
             self.server.changed.notify_all()
         if path == "/api/0/info":
+            if self.server.info_failures:
+                self.server.info_failures -= 1
+                self.send_error(503, "Server starting")
+                return
             response = {
                 "hostname": socket.gethostname(),
                 "version": "test",
@@ -138,8 +143,8 @@ class OptInTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.config = Path(self.temp.name) / "config.toml"
 
-    def server(self, settings):
-        server = MockActivityWatch(settings)
+    def server(self, settings, port=0):
+        server = MockActivityWatch(settings, port)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.server_close)
@@ -244,6 +249,49 @@ class OptInTests(unittest.TestCase):
                 self.assertIn("Work", json.loads(stdout)["message"])
                 self.assertEqual(len(server.matching("/query")), 1)
                 self.assertEqual(server.matching("/heartbeat"), [])
+
+    def test_daemon_retries_until_api_ready_before_reading_opt_in(self):
+        server = self.server({"enabled": False, **QUIET_CONFIG})
+        server.info_failures = 2
+        process = self.launch(server, "start", local_enabled=True)
+        stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(stdout, "")
+        paths = [urlsplit(r[1]).path for r in server.requests]
+        self.assertEqual(paths, ["/api/0/info"] * 3 + ["/api/0/settings/aw-notify"])
+        self.assertIn("retrying in", stderr)
+
+    def test_daemon_survives_delayed_server_start(self):
+        # Reserve the port without listening so the initial connection fails.
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+            target = type("Target", (), {"server_port": port})()
+            process = self.launch(target, "start", local_enabled=False)
+            time.sleep(1.5)
+            self.assertIsNone(process.poll(), "Daemon exited before server started")
+        server = self.server({"enabled": True, **QUIET_CONFIG}, port)
+        self.assertTrue(server.wait_for_heartbeats(1, timeout=20), "No heartbeat after server started")
+        self.assertIsNone(process.poll())
+
+    def test_daemon_reports_exhausted_startup_retries(self):
+        server = self.server({"enabled": True, **QUIET_CONFIG})
+        server.info_failures = 10
+        process = self.launch(server, "start")
+        stdout, stderr = process.communicate(timeout=25)
+        self.assertEqual(process.returncode, 1, stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(server.matching("/info")), 5)
+        self.assertEqual(server.matching("/settings/aw-notify"), [])
+        self.assertIn("unavailable after 5 startup attempts", stderr)
+
+    def test_one_shot_does_not_retry_unavailable_api(self):
+        server = self.server({"enabled": True, **QUIET_CONFIG})
+        server.info_failures = 10
+        process = self.launch(server, "checkin")
+        _, stderr = process.communicate(timeout=3)
+        self.assertEqual(process.returncode, 1, stderr)
+        self.assertEqual(len(server.matching("/info")), 1)
 
     def test_enabled_daemon_heartbeats_and_stops_on_sigint(self):
         server = self.server({"enabled": True, **QUIET_CONFIG})
