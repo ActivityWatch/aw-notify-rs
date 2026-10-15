@@ -7,11 +7,12 @@ use anyhow::{anyhow, Result};
 use aw_client_rust::classes::{default_classes, CategoryId, CategorySpec, ClassSetting};
 use aw_client_rust::queries::{DesktopQueryParams, QueryParams, QueryParamsBase};
 use aw_models::TimeInterval;
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use clap::Parser;
 use crossbeam_channel::{bounded, unbounded, Receiver};
 use dashmap::DashMap;
 use hostname::get as get_hostname;
+use jiff::{tz::TimeZone as JiffTimeZone, Timestamp, Zoned};
 use notify_rust::Notification;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ use std::time;
 mod dirs;
 mod lease;
 mod logging;
+mod scheduling;
 mod telemetry;
 
 use telemetry::{AlertType, Telemetry};
@@ -247,8 +249,8 @@ fn load_config(custom_path: Option<std::path::PathBuf>) -> Result<NotificationCo
 /// Unset fields fall back to their `Default` values, not to the local TOML. This is
 /// intentional: the server config is the authoritative complete config, not a patch.
 ///
-/// On any failure (key absent / null response, server unreachable *before*
-/// `get_info()` exits the process, malformed JSON), the local config is returned
+/// On any failure (key absent / null response, server unreachable after the
+/// startup readiness check, malformed JSON), the local config is returned
 /// unchanged.
 fn try_load_server_config(
     client: &aw_client_rust::blocking::AwClient,
@@ -316,7 +318,11 @@ fn run_app(cli: Cli) -> Result<()> {
     };
     let client = aw_client_rust::blocking::AwClient::new("127.0.0.1", port, client_name)
         .map_err(|e| anyhow!("Failed to create client: {}", e))?;
-    client.get_info()?;
+    if matches!(command, Commands::Start) {
+        wait_for_server(&client)?;
+    } else {
+        client.get_info()?;
+    }
     let config = try_load_server_config(&client, config);
     if !config.enabled {
         log::info!("Notifications disabled; set enabled = true in aw-notify settings to opt in");
@@ -335,6 +341,31 @@ fn run_app(cli: Cli) -> Result<()> {
         Commands::Checkin { .. } => send_checkin("Time today", None),
         Commands::CheckinDetailed { .. } => send_detailed_checkin("Detailed Time Summary", None),
     }
+}
+
+/// Managers can launch us before the server is ready. Retry the actual info
+/// request, not just a TCP connection, before reading the shared opt-in setting.
+/// The five attempts use the client's request timeout, with 1/2/4/8s backoff.
+fn wait_for_server(client: &aw_client_rust::blocking::AwClient) -> Result<()> {
+    let mut delay = time::Duration::from_secs(1);
+    for attempt in 1..=5 {
+        match client.get_info() {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt == 5 => {
+                return Err(anyhow!(error)
+                    .context("ActivityWatch server unavailable after 5 startup attempts"));
+            }
+            Err(error) => {
+                log::warn!(
+                    "ActivityWatch server not ready (attempt {attempt}/5): {error}; retrying in {}s",
+                    delay.as_secs()
+                );
+                thread::sleep(delay);
+                delay *= 2;
+            }
+        }
+    }
+    unreachable!("the final attempt always returns")
 }
 
 fn start_service(hostname: String, config: NotificationConfig) -> Result<()> {
@@ -498,33 +529,39 @@ impl CategoryAlert {
             .collect()
     }
 
-    fn time_to_next_threshold(&self) -> Duration {
+    fn time_to_next_threshold(&self) -> Result<Duration> {
         let untriggered = self.thresholds_untriggered();
         if untriggered.is_empty() {
             // If no thresholds to trigger, wait until tomorrow (like Python)
-            let now = Local::now();
-            let day_end = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-            let mut day_end = Local.from_local_datetime(&day_end).single().unwrap();
-            if day_end < now {
-                day_end += Duration::days(1);
-            }
-            let time_to_next_day = day_end - now + TIME_OFFSET;
-            return time_to_next_day
+            let now = Zoned::now();
+            let (_, day_end) = scheduling::day_bounds(&now)?;
+            let time_to_next_day = day_end - scheduling::to_utc(&now)?;
+            return Ok(time_to_next_day
                 + self
                     .thresholds
                     .iter()
                     .min()
                     .cloned()
-                    .unwrap_or(Duration::zero());
+                    .unwrap_or(Duration::zero()));
         }
 
         let min_threshold = untriggered.iter().min().cloned().unwrap();
-        (min_threshold - self.time_spent).max(Duration::zero())
+        Ok((min_threshold - self.time_spent).max(Duration::zero()))
     }
 
     fn update(&mut self) {
         let now = Local::now();
-        let time_to_threshold = self.time_to_next_threshold();
+        let time_to_threshold = match self.time_to_next_threshold() {
+            Ok(duration) => duration,
+            Err(error) => {
+                log::error!(
+                    "Unable to schedule threshold for {}: {}",
+                    self.category,
+                    error
+                );
+                return;
+            }
+        };
 
         if now.with_timezone(&Utc) > (self.last_check + time_to_threshold) {
             // Get time data (will use cached version if available)
@@ -709,29 +746,10 @@ fn query_activitywatch(date: Option<DateTime<Utc>>) -> Result<HashMap<String, f6
 
     let date = date.unwrap_or_else(|| Local::now().with_timezone(&Utc));
 
-    // Set timeperiod to the requested date (like old version)
-    let local_date = date.with_timezone(&Local);
-    log::debug!(
-        "Query date in local timezone: {}",
-        local_date.format("%Y-%m-%d %H:%M:%S %z")
-    );
-    let day_start = Local
-        .with_ymd_and_hms(
-            local_date.year(),
-            local_date.month(),
-            local_date.day(),
-            0,
-            0,
-            0,
-        )
-        .single()
-        .unwrap()
-        .with_timezone(&Utc);
-
-    let timeperiod = TimeInterval::new(
-        day_start + TIME_OFFSET,
-        day_start + TIME_OFFSET + Duration::days(1),
-    );
+    let local_date = Timestamp::new(date.timestamp(), date.timestamp_subsec_nanos() as i32)?
+        .to_zoned(JiffTimeZone::system());
+    let (day_start, day_end) = scheduling::day_bounds(&local_date)?;
+    let timeperiod = TimeInterval::new(day_start, day_end);
 
     // Build QueryParams like old version
     let bid_window = format!("aw-watcher-window_{}", hostname);
@@ -932,12 +950,12 @@ fn send_detailed_checkin(title: &str, date: Option<DateTime<Utc>>) -> Result<()>
 }
 
 fn send_checkin_yesterday() -> Result<()> {
-    let yesterday = Local::now().with_timezone(&Utc) - Duration::days(1);
+    let yesterday = scheduling::to_utc(&Zoned::now().yesterday()?)?;
     send_checkin("Time yesterday", Some(yesterday))
 }
 
 fn send_productivity_score_yesterday() -> Result<()> {
-    let yesterday = Local::now().with_timezone(&Utc) - Duration::days(1);
+    let yesterday = scheduling::to_utc(&Zoned::now().yesterday()?)?;
     if let Ok(Some((score, percent))) = calculate_productivity_score(Some(yesterday)) {
         let message = format!("{:+.1} ({:.1}% productive)", score, percent);
         notify(AlertType::ProductivityScore, "Productivity Score", &message)?;
@@ -958,7 +976,7 @@ fn send_initial_checkins(productivity_score: bool) -> Result<()> {
         let mut output = String::new();
 
         // Get yesterday's data
-        let yesterday = Local::now().with_timezone(&Utc) - Duration::days(1);
+        let yesterday = scheduling::to_utc(&Zoned::now().yesterday()?)?;
         let cat_time_yesterday = get_time(Some(yesterday), CategoryAggregation::TopLevelOnly)?;
         let top_categories_yesterday =
             get_top_level_categories_for_notifications(&cat_time_yesterday, 0.02, 4);
@@ -1042,16 +1060,17 @@ fn start_hourly(hostname: String, shutdown_rx: Receiver<()>) {
 
         loop {
             // Wait until next whole hour (like Python)
-            let now = Local::now();
-            let next_hour = now + Duration::hours(1);
-            let next_hour = next_hour
-                .date_naive()
-                .and_hms_opt(next_hour.hour(), 0, 0)
-                .unwrap();
-            let next_hour = Local.from_local_datetime(&next_hour).single().unwrap();
-            let sleep_time = (next_hour - now)
-                .to_std()
-                .unwrap_or(time::Duration::from_secs(3600));
+            let sleep_time = match scheduling::next_hour_delay(&Zoned::now()) {
+                Ok(delay) => delay,
+                Err(error) => {
+                    log::error!("Unable to schedule hourly checkin: {error}");
+                    // Retry without spinning or terminating the notification service.
+                    match shutdown_rx.recv_timeout(time::Duration::from_secs(60)) {
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        _ => break,
+                    }
+                }
+            };
 
             // Wait for either timeout (next hour) or shutdown signal
             match shutdown_rx.recv_timeout(sleep_time) {
@@ -1096,7 +1115,7 @@ fn start_new_day(hostname: String, shutdown_rx: Receiver<()>, productivity_score
     thread::spawn(move || {
         log::info!("Starting new day notification thread");
 
-        let mut last_day = (Local::now() - TIME_OFFSET).date_naive();
+        let mut last_day = (Local::now().naive_local() - TIME_OFFSET).date();
         log::info!(
             "Starting new day detection with local timezone: {}",
             Local::now().format("%Y-%m-%d %H:%M:%S %z")
@@ -1104,7 +1123,7 @@ fn start_new_day(hostname: String, shutdown_rx: Receiver<()>, productivity_score
 
         loop {
             let now = Local::now();
-            let day = (now - TIME_OFFSET).date_naive();
+            let day = (now.naive_local() - TIME_OFFSET).date();
             log::debug!(
                 "Checking new day: current local time = {}, day = {}",
                 now.format("%Y-%m-%d %H:%M:%S %z"),
