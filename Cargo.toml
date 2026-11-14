@@ -17,6 +17,9 @@ members = ["crates/aw-notify-client"]
 name = "aw-notify"
 path = "src/main.rs"
 
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 # Shared notification client + wire types (also re-used server-side)
 aw-notify-client = { path = "crates/aw-notify-client" }
