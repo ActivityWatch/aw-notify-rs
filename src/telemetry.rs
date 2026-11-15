@@ -21,6 +21,7 @@ pub enum AlertType {
     NewDay,
     ServerStatus,
     External,
+    Distraction,
 }
 
 impl AlertType {
@@ -32,6 +33,7 @@ impl AlertType {
             Self::NewDay => "new_day",
             Self::ServerStatus => "server_status",
             Self::External => "external",
+            Self::Distraction => "distraction",
         }
     }
 }
@@ -61,6 +63,7 @@ impl Telemetry {
                     AlertType::NewDay,
                     AlertType::ServerStatus,
                     AlertType::External,
+                    AlertType::Distraction,
                 ]
                 .into_iter()
                 .map(|kind| (kind.key(), Counts::default()))
