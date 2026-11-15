@@ -90,3 +90,13 @@ jobs:
 
       - name: Build Release
         run: cargo build --release
+
+      # Code-signing services require product name/version metadata on each exe.
+      - name: Check Windows version resource
+        shell: pwsh
+        run: |
+          $info = (Get-Item target/release/aw-notify.exe).VersionInfo
+          "aw-notify: $($info.ProductName) $($info.ProductVersion) (file $($info.FileVersion))"
+          if ($info.ProductName -ne 'ActivityWatch' -or $info.OriginalFilename -ne 'aw-notify.exe') {
+            throw 'aw-notify.exe has no ActivityWatch version resource'
+          }
