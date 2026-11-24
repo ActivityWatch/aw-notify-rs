@@ -12,7 +12,7 @@ use clap::Parser;
 use crossbeam_channel::{bounded, unbounded, Receiver};
 use dashmap::DashMap;
 use hostname::get as get_hostname;
-use jiff::{tz::TimeZone as JiffTimeZone, Timestamp, Zoned};
+use jiff::{civil::Date as JiffDate, tz::TimeZone as JiffTimeZone, Timestamp, Zoned};
 use notify_rust::Notification;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -502,6 +502,8 @@ struct CategoryAlert {
     thresholds: Vec<Duration>,
     max_triggered: Duration,
     time_spent: Duration,
+    /// Logical day that max_triggered and time_spent belong to.
+    day: Option<JiffDate>,
     last_check: DateTime<Utc>,
     positive: bool,
     last_status: Option<String>,
@@ -515,9 +517,20 @@ impl CategoryAlert {
             thresholds,
             max_triggered: Duration::zero(),
             time_spent: Duration::zero(),
+            day: None,
             last_check: Utc.timestamp_opt(0, 0).unwrap(),
             positive,
             last_status: None,
+        }
+    }
+
+    /// Start a new logical day afresh. update() only overwrites time_spent when
+    /// today's query lists the category, so yesterday's total is cleared here too.
+    fn set_day(&mut self, day: JiffDate) {
+        if self.day != Some(day) {
+            self.day = Some(day);
+            self.max_triggered = Duration::zero();
+            self.time_spent = Duration::zero();
         }
     }
 
@@ -550,6 +563,10 @@ impl CategoryAlert {
     }
 
     fn update(&mut self) {
+        match scheduling::logical_date(&Zoned::now()) {
+            Ok(day) => self.set_day(day),
+            Err(error) => log::error!("Unable to determine today for {}: {}", self.category, error),
+        }
         let now = Local::now();
         let time_to_threshold = match self.time_to_next_threshold() {
             Ok(duration) => duration,
@@ -700,12 +717,21 @@ fn threshold_alerts(shutdown_rx: Receiver<()>, alert_configs: Vec<AlertConfig>) 
     Ok(())
 }
 
+/// "Today" is keyed by logical day, so the cache can't serve yesterday's totals
+/// to an alert that just rolled over at the day boundary.
+fn time_cache_key(date: Option<DateTime<Utc>>, now: &Zoned) -> Result<String> {
+    Ok(match date {
+        Some(date) => format!("{:?}", date),
+        None => format!("today {}", scheduling::logical_date(now)?),
+    })
+}
+
 // Cache implementation (matching Python's @cache_ttl decorator)
 fn get_time(
     date: Option<DateTime<Utc>>,
     aggregation_mode: CategoryAggregation,
 ) -> Result<HashMap<String, f64>> {
-    let cache_key = format!("{:?}", date);
+    let cache_key = time_cache_key(date, &Zoned::now())?;
 
     let raw_data = {
         let mut hit = None;
@@ -2098,5 +2124,65 @@ mod tests {
             parse_result.is_err(),
             "null should not parse as NotificationConfig"
         );
+    }
+
+    fn alert_after_long_day() -> (CategoryAlert, JiffDate) {
+        let day = jiff::civil::date(2026, 1, 1);
+        let mut alert = CategoryAlert::new(
+            "Work",
+            vec![Duration::hours(1), Duration::hours(2)],
+            None,
+            false,
+        );
+        alert.set_day(day);
+        alert.time_spent = Duration::hours(3);
+        alert.check(true);
+        assert_eq!(alert.max_triggered, Duration::hours(2));
+        (alert, day)
+    }
+
+    #[test]
+    fn threshold_alerts_rearm_on_new_day() {
+        let (mut alert, day) = alert_after_long_day();
+
+        // The same day must not forget what already fired.
+        alert.set_day(day);
+        assert_eq!(alert.max_triggered, Duration::hours(2));
+
+        alert.set_day(day.tomorrow().unwrap());
+        alert.time_spent = Duration::minutes(90);
+        alert.check(true);
+        assert_eq!(
+            alert.max_triggered,
+            Duration::hours(1),
+            "the 1h threshold should fire again on day 2"
+        );
+    }
+
+    #[test]
+    fn todays_time_cache_expires_at_day_boundary() -> Result<()> {
+        let key = |now: &str| time_cache_key(None, &now.parse()?);
+        assert_eq!(
+            key("2026-01-02T03:59[Europe/Stockholm]")?,
+            key("2026-01-01T04:00[Europe/Stockholm]")?
+        );
+        assert_ne!(
+            key("2026-01-02T03:59[Europe/Stockholm]")?,
+            key("2026-01-02T04:00[Europe/Stockholm]")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn new_day_without_activity_refires_nothing() {
+        let (mut alert, day) = alert_after_long_day();
+
+        // No query has returned today's total yet, so update() would keep
+        // yesterday's time_spent; the day change itself must clear it.
+        alert.set_day(day.tomorrow().unwrap());
+        alert.check(true);
+        assert_eq!(alert.time_spent, Duration::zero());
+        assert_eq!(alert.max_triggered, Duration::zero());
+        assert_eq!(alert.thresholds_untriggered(), alert.thresholds);
     }
 }
