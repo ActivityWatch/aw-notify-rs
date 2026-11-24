@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use jiff::{civil::DateTimeRound, RoundMode, ToSpan, Unit, Zoned, ZonedRound};
+use jiff::{civil::Date, civil::DateTimeRound, RoundMode, ToSpan, Unit, Zoned, ZonedRound};
 
 pub fn to_utc(time: &Zoned) -> Result<DateTime<Utc>> {
     let nanos = time.timestamp().as_nanosecond();
@@ -11,11 +11,16 @@ pub fn to_utc(time: &Zoned) -> Result<DateTime<Utc>> {
     .ok_or_else(|| anyhow!("Timestamp is out of range"))
 }
 
-/// Resolve 04:00 on each calendar date independently, preserving 23/25-hour days.
+/// The logical day `now` belongs to: days start at 04:00, so 02:00 is still yesterday.
+pub fn logical_date(now: &Zoned) -> Result<Date> {
+    let offset = crate::TIME_OFFSET.num_hours().hours();
+    Ok(now.datetime().checked_sub(offset)?.date())
+}
+
+/// Bounds of the logical day containing `date`, from 04:00 to 04:00.
+/// Each boundary resolves on its own calendar date, preserving 23/25-hour days.
 pub fn day_bounds(date: &Zoned) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let start = date
-        .date()
-        .at(crate::TIME_OFFSET.num_hours() as i8, 0, 0, 0);
+    let start = logical_date(date)?.at(crate::TIME_OFFSET.num_hours() as i8, 0, 0, 0);
     let timezone = date.time_zone();
     Ok((
         to_utc(&start.to_zoned(timezone.clone())?)?,
@@ -70,6 +75,28 @@ mod tests {
             assert_eq!(
                 next_hour_delay(&input.parse()?)?,
                 std::time::Duration::from_secs(minutes * 60)
+            );
+        }
+        Ok(())
+    }
+
+    /// Between 00:00 and 04:00 local, "today" is still the logical day that
+    /// started at 04:00 on the previous calendar date.
+    #[test]
+    fn day_bounds_contain_now_before_day_start_offset() -> Result<()> {
+        for input in [
+            "2026-01-02T02:00[Europe/Stockholm]",
+            "2026-01-02T00:30[America/New_York]",
+            "2026-01-02T03:59[Asia/Tokyo]",
+            "2026-01-02T04:00[Europe/Stockholm]",
+            "2026-01-02T23:59[Europe/Stockholm]",
+        ] {
+            let now: Zoned = input.parse()?;
+            let (start, end) = day_bounds(&now)?;
+            let now_utc = to_utc(&now)?;
+            assert!(
+                start <= now_utc && now_utc < end,
+                "{input}: window {start}..{end} does not contain now ({now_utc})"
             );
         }
         Ok(())
